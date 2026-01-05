@@ -1,0 +1,64 @@
+trainer:
+  batch_size: 2
+
+checkpoint: TryFirst
+
+data_loader:
+  out_img_dir: /mnt/liangjm/SpR_data/
+  train_ratio: 0.7
+  val_ratio: 0.1
+  test_ratio: 0.2
+  patch_num: 100  # 每个 WSI 切取的 patch 数量
+  num_workers: 0
+  pin_memory: False
+  seed: 2025
+  # CLAM for WSI 切片参数
+  patch_size: 512
+  step_size: 512
+  down_scale: 4   # 设定 LR 较之 HR 的缩放比例
+  min_tissue_ratio: 0.8 # 设定切片时的最小组织比例
+  patch_level: 0  # 设定切片时所用的层级, 0 通常是最高分辨率, 40x
+
+# sam:
+#   ckpt: ./src/model/sam_vit_h_4b8939.pth
+#   model_type: vit_h
+#   device: cuda
+
+sr:
+  pretrained_sd15: runwayml/stable-diffusion-v1-5   # 或者本地路径 /mnt/liangjm/models/sd15
+  output_dir: ./outputs/sr_controlnet
+  token: hf_token
+  lr: 1e-5
+  train_steps: 20000
+  grad_accum: 1
+  mixed_precision: fp16
+  save_every: 2000
+  device: cuda
+
+  # vfm 配置
+  vfm:
+    name: dinov2
+    variant: dinov2_vitb14         # vitb14 / vitl14 / vitg14 (越大越强越慢)
+    local_dir: ./src/models/dinov2_vitb14  # 离线本地路径
+    image_size: 518                # DINOv2常用 518；也可 512
+    patch_size: 14                 # vitb14=14
+    control_mode: energy_edge_gray # 输出3通道如何组装
+    normalize: true
+    cache: false
+
+  # validation
+  val_every: 100        # 每多少 step 做一次验证
+  val_batches: 10       # 验证取多少个 batch
+  sample_steps: 20      # 采样(反推)步数：20先跑通，后续可调到30/50
+
+TCGA_LUAD:
+  root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-LUAD/
+  choose_WSI: 10
+
+TCGA_KIRC:
+  root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-KIRC/
+  choose_WSI: 10
+
+TCGA_LIHC:
+  root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-LIHC/
+  choose_WSI: 10
