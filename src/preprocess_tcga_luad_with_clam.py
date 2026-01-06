@@ -1,6 +1,5 @@
 import os
 import re
-import os
 import sys
 import h5py
 import tqdm
@@ -16,7 +15,6 @@ from typing import Optional, Dict, Any
 from create_patches_fp import seg_and_patch
 
 
-
 def slide_to_case_id(slide_name: str) -> str:
     """
     TCGA slide -> case id
@@ -28,8 +26,9 @@ def slide_to_case_id(slide_name: str) -> str:
     case_id = "-".join(parts[:3])
     return case_id
 
+
 def slide_id_from_path(svs_path: str) -> str:
-    return os.path.basename(svs_path).replace(".svs","")
+    return os.path.basename(svs_path).replace(".svs", "")
 
 
 def compute_tissue_ratio(
@@ -40,11 +39,11 @@ def compute_tissue_ratio(
     粗略估计组织占比：认为 “灰度 < white_thr” 的像素是组织（或非纯白背景）。
     返回 [0,1] 之间的比例。
     """
-    arr = np.asarray(patch).astype(np.float32) / 255.0   # [H,W,3]
+    arr = np.asarray(patch).astype(np.float32) / 255.0  # [H,W,3]
     if arr.ndim != 3 or arr.shape[2] != 3:
         return 0.0
-    gray = arr.mean(axis=2)              # [H,W]
-    tissue_mask = gray < white_thr       # 非白背景
+    gray = arr.mean(axis=2)  # [H,W]
+    tissue_mask = gray < white_thr  # 非白背景
     ratio = tissue_mask.mean().item()
     return float(ratio)
 
@@ -55,15 +54,17 @@ def export_h5_to_pngs(
     hr_dir: str,
     lr_dir: str,
     scale: int = 4,
-    min_tissue_ratio: float = 0.7,   # 至少 70% 组织
-    white_thr: float = 0.9,          # 灰度 > 0.9 视作近白背景
+    min_tissue_ratio: float = 0.7,  # 至少 70% 组织
+    white_thr: float = 0.9,         # 灰度 > 0.9 视作近白背景
+    limit_samples: Optional[int] = None,  # ✅ NEW: 每个 slide 最多保存多少张（达到后中止并视为 DONE）
 ):
     """
     用 h5 里的 coords + 对应 svs，从原始 WSI 裁 patch，并保存 HR/LR png。
     特性：
       - 只保存组织占比 >= min_tissue_ratio 的 patch；
       - 使用 .PROGRESS 记录当前处理到的 coord 索引，实现断点续切；
-      - 处理完所有 coords 后写 .DONE，自检时可直接跳过该样本。
+      - 处理完所有 coords 后写 .DONE，自检时可直接跳过该样本；
+      - ✅ 若 limit_samples 设定：保存到上限即中止，并写 .DONE（下次直接跳过）
     """
     os.makedirs(hr_dir, exist_ok=True)
     os.makedirs(lr_dir, exist_ok=True)
@@ -71,9 +72,27 @@ def export_h5_to_pngs(
     done_flag = os.path.join(hr_dir, ".DONE")
     progress_file = os.path.join(hr_dir, ".PROGRESS")
 
-    # 0) 如果已经有 .DONE，说明整个 sample 已经处理完，直接跳过
+    # 0) 如果已经有 .DONE，说明整个 sample 已经处理完（或已达到 limit），直接跳过
     if os.path.exists(done_flag):
         print(f"[SKIP] {os.path.basename(svs_path)} already DONE.")
+        return
+
+    # 0.5) 如果已有 PNG 达到 limit_samples：直接标记 DONE 并跳过
+    existing_hr = [
+        fn for fn in os.listdir(hr_dir)
+        if fn.startswith("patch_") and fn.endswith(".png")
+    ]
+    kept_count = len(existing_hr)
+
+    if (limit_samples is not None) and (int(limit_samples) > 0) and (kept_count >= int(limit_samples)):
+        print(
+            f"[SKIP] {os.path.basename(svs_path)} reached limit_samples={int(limit_samples)} "
+            f"(existing_png={kept_count}). Mark DONE."
+        )
+        with open(done_flag, "w") as f:
+            f.write("done")
+        if os.path.exists(progress_file):
+            os.remove(progress_file)
         return
 
     # 1) 读取 coords & patch 属性
@@ -84,7 +103,7 @@ def export_h5_to_pngs(
                 "请确认 create_patches_fp.py 是否成功运行。"
             )
         dset = f["coords"]
-        coords = dset[:]                      # [N, 2] (x, y)
+        coords = dset[:]  # [N, 2] (x, y)
         patch_level = int(dset.attrs["patch_level"])
         patch_size = int(dset.attrs["patch_size"])
 
@@ -106,6 +125,8 @@ def export_h5_to_pngs(
         print(f"[INFO] {os.path.basename(svs_path)} already fully processed, marking DONE.")
         with open(done_flag, "w") as f:
             f.write("done")
+        if os.path.exists(progress_file):
+            os.remove(progress_file)
         return
 
     start_idx = last_idx + 1
@@ -117,25 +138,25 @@ def export_h5_to_pngs(
     wsi = openslide.OpenSlide(svs_path)
     slide_name = os.path.basename(svs_path)
 
-    # 已保存的 patch 数，用于命名（不会影响断点逻辑）
-    existing_hr = [
-        fn for fn in os.listdir(hr_dir)
-        if fn.startswith("patch_") and fn.endswith(".png")
-    ]
-    kept_count = len(existing_hr)
-
     print(
         f"[RESUME] slide={slide_name}, total_coords={N}, "
         f"last_idx={last_idx}, start_idx={start_idx}, "
-        f"existing_png={kept_count}"
+        f"existing_png={kept_count}, limit_samples={limit_samples}"
     )
 
     # 4) 从 start_idx 开始处理，tqdm 显示进度
+    stopped_by_limit = False
     for idx in tqdm.tqdm(
         range(start_idx, N),
         desc=f"{slide_name} patches",
-        unit="patch"
+        unit="patch",
     ):
+        # ✅ 达到上限：直接停止该 slide 的导出
+        if (limit_samples is not None) and (int(limit_samples) > 0) and (kept_count >= int(limit_samples)):
+            stopped_by_limit = True
+            print(f"[STOP] {slide_name}: reached limit_samples={int(limit_samples)}, stop exporting.")
+            break
+
         xy = coords[idx]
         x, y = int(xy[0]), int(xy[1])
 
@@ -147,6 +168,7 @@ def export_h5_to_pngs(
 
         # 计算组织占比
         ratio = compute_tissue_ratio(patch, white_thr=white_thr)
+
         # 不满足阈值：认为该 coord 已处理，但不保存 png
         if ratio < min_tissue_ratio:
             # 仍然更新 progress，表示这个 coord 已经访问过
@@ -173,7 +195,13 @@ def export_h5_to_pngs(
         with open(progress_file, "w") as f:
             f.write(str(idx))
 
-    # 5) 所有 coords 都处理完，标记 DONE，并可选择删除 PROGRESS
+        # ✅ 刚好达到上限：立刻结束
+        if (limit_samples is not None) and (int(limit_samples) > 0) and (kept_count >= int(limit_samples)):
+            stopped_by_limit = True
+            print(f"[STOP] {slide_name}: reached limit_samples={int(limit_samples)} after save, stop exporting.")
+            break
+
+    # 5) 无论是否提前 stop，都标记 DONE（达到上限也视作完成，便于下次直接跳过）
     wsi.close()
     with open(done_flag, "w") as f:
         f.write("done")
@@ -182,10 +210,9 @@ def export_h5_to_pngs(
 
     print(
         f"[DONE] {slide_name}: "
-        f"{kept_count} patches saved (coords processed: {N}, "
-        f"min_tissue_ratio={min_tissue_ratio})"
+        f"{kept_count} patches saved "
+        f"(coords_total={N}, min_tissue_ratio={min_tissue_ratio}, limit_samples={limit_samples}, stopped_by_limit={stopped_by_limit})"
     )
-    
 
 
 def _load_json(path: str):
@@ -194,11 +221,13 @@ def _load_json(path: str):
             return json.load(f)
     return {}
 
+
 def _save_json(path: str, obj: dict):
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
+
 
 def _case_has_done_slide(out_hr_root: str, case_id: str) -> bool:
     # slide_id 目录名一般形如：TCGA-S2-AA1A-01Z-00-DX1
@@ -207,6 +236,7 @@ def _case_has_done_slide(out_hr_root: str, case_id: str) -> bool:
         if os.path.isdir(slide_dir) and os.path.exists(os.path.join(slide_dir, ".DONE")):
             return True
     return False
+
 
 def _get_cases_in_out_clin(out_clin_path: str, data_name: str, id_col: str) -> set:
     if not os.path.exists(out_clin_path):
@@ -221,6 +251,7 @@ def _get_cases_in_out_clin(out_clin_path: str, data_name: str, id_col: str) -> s
     else:
         return set()
     return set(sub[id_col].astype(str).tolist())
+
 
 def _append_to_out_clin(out_clin_path: str, rows, id_col: str):
     if not rows:
@@ -240,6 +271,7 @@ def _append_to_out_clin(out_clin_path: str, rows, id_col: str):
 
     merged.to_csv(out_clin_path, sep="\t", index=False)
 
+
 def run_clam_and_export(
     data_cfg: Dict[str, list],
     out_img_dir: str,
@@ -250,6 +282,7 @@ def run_clam_and_export(
     min_tissue_ratio: float = 0.7,
     id_col: str = "case_submitter_id",
     seed: int = 0,
+    limit_samples: Optional[int] = None,  # ✅ NEW: 每个 slide 的最多导出 PNG 数
 ):
     """
     支持 choose_WSI 递增：
@@ -280,11 +313,12 @@ def run_clam_and_export(
 
         print(f"\n========== DATASET: {data_name} ==========")
         print(f"image_root={image_root}, target choose_WSI={choose_WSI}")
+        print(f"limit_samples(per-slide)={limit_samples}")
 
-        svs_dir  = os.path.join(image_root, "img")
+        svs_dir = os.path.join(image_root, "img")
         clam_dir = os.path.join(image_root, "clam_results")
-        patch_save_dir  = os.path.join(clam_dir, "patches")
-        mask_save_dir   = os.path.join(clam_dir, "masks")
+        patch_save_dir = os.path.join(clam_dir, "patches")
+        mask_save_dir = os.path.join(clam_dir, "masks")
         stitch_save_dir = os.path.join(clam_dir, "stitches")
         os.makedirs(patch_save_dir, exist_ok=True)
         os.makedirs(mask_save_dir, exist_ok=True)
@@ -342,10 +376,8 @@ def run_clam_and_export(
 
         # --- 新增：优先补完“已选但未完成”的病例 ---
         selected_not_done = sorted([cid for cid in chosen_set if cid in all_case_ids and cid not in done_set])
-        # 我们最多只需要补 need 个病例达到目标
         fix_cases = selected_not_done[:need]
 
-        # 如果补完这些仍不够，再新增未选病例
         remain = need - len(fix_cases)
         add_cases = []
         if remain > 0:
@@ -364,7 +396,7 @@ def run_clam_and_export(
 
         print(f"[PLAN] {data_name}: fix_cases={fix_cases}, add_cases={add_cases}")
 
-        # 这些病例对应的 slides（这里保持你原逻辑：一个病例可能多个 slide 都切）
+        # 这些病例对应的 slides
         target_slides = []
         for cid in target_cases:
             target_slides.extend(case_to_slides.get(cid, []))
@@ -376,7 +408,7 @@ def run_clam_and_export(
 
         # 生成 process_list（增量）
         process_list_path = os.path.join(clam_dir, f"process_list_{data_name}_increment.csv")
-        pd.DataFrame({"slide_id": target_slides, "process": [1]*len(target_slides)}).to_csv(process_list_path, index=False)
+        pd.DataFrame({"slide_id": target_slides, "process": [1] * len(target_slides)}).to_csv(process_list_path, index=False)
 
         # seg_and_patch 参数（保持你原样）
         seg_params = {
@@ -389,8 +421,8 @@ def run_clam_and_export(
             "exclude_ids": "none",
         }
         filter_params = {"a_t": 100, "a_h": 16, "max_n_holes": 8}
-        vis_params    = {"vis_level": -1, "line_thickness": 250}
-        patch_params  = {"use_padding": True, "contour_fn": "four_pt"}
+        vis_params = {"vis_level": -1, "line_thickness": 250}
+        patch_params = {"use_padding": True, "contour_fn": "four_pt"}
 
         print(f">>> [CLAM] {data_name}: seg_and_patch increment slides={len(target_slides)}")
         seg_and_patch(
@@ -433,6 +465,7 @@ def run_clam_and_export(
                 lr_dir=lr_dir,
                 scale=down_scale,
                 min_tissue_ratio=min_tissue_ratio,
+                limit_samples=limit_samples,  # ✅ NEW
             )
 
         # 补 clinical：对 fix_cases/add_cases 都确保写入

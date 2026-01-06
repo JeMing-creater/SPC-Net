@@ -4,11 +4,11 @@ trainer:
 checkpoint: TryFirst
 
 data_loader:
-  out_img_dir: /mnt/liangjm/SpR_data/
+  out_img_dir: /mnt/liangjm/SpRR_data/
   train_ratio: 0.7
   val_ratio: 0.1
   test_ratio: 0.2
-  patch_num: 100  # 每个 WSI 切取的 patch 数量
+  patch_num: 300  # 每个 WSI 切取的 patch 数量，限制h5导出png数量(patch-num + 200)
   num_workers: 0
   pin_memory: False
   seed: 2025
@@ -29,11 +29,15 @@ sr:
   output_dir: ./outputs/sr_controlnet
   token: hf_token
   lr: 1e-5
-  train_steps: 20000
+  train_steps: 50000
   grad_accum: 1
   mixed_precision: fp16
   save_every: 2000
   device: cuda
+
+  resume_ckpt: ""    # 例如 ./outputs/sr_controlnet/checkpoints/step_00002000
+  save_full_ckpt: true
+  val_vis_keep: 5    # 验证时保存多少张可视化图片
 
   # vfm 配置
   vfm:
@@ -53,12 +57,12 @@ sr:
 
 TCGA_LUAD:
   root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-LUAD/
-  choose_WSI: 10
+  choose_WSI: 50
 
 TCGA_KIRC:
   root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-KIRC/
-  choose_WSI: 10
+  choose_WSI: 50
 
 TCGA_LIHC:
   root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-LIHC/
-  choose_WSI: 10
+  choose_WSI: 50

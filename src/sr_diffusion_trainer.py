@@ -1,26 +1,22 @@
 # src/sr_diffusion_trainer.py
 import os
-# 可选：huggingface 镜像加速（如果 cfg.pretrained_sd15 指向本地目录，不影响）
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-
-import numpy as np
-from PIL import Image
-
+import re
+import json
 from dataclasses import dataclass
 from typing import Optional, Dict
 
 import numpy as np
+from PIL import Image
+
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm import tqdm
 
-from diffusers import (
-    AutoencoderKL,
-    UNet2DConditionModel,
-    ControlNetModel,
-    DDPMScheduler,
-)
+# 可选：huggingface 镜像加速（如果 cfg.pretrained_sd15 指向本地目录，不影响）
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+from diffusers import AutoencoderKL, UNet2DConditionModel, ControlNetModel, DDPMScheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 
 from src.sr_metrics import SRMetrics
@@ -31,9 +27,9 @@ from src.vfm_control import VFMConfig, VFMControlGenerator
 
 @dataclass
 class SRTrainConfig:
-    # SD1.5：可以是 repo_id（需联网）或本地目录（推荐离线）
+    # SD1.5：repo_id（需联网）或本地目录（推荐离线）
     pretrained_sd15: str = "runwayml/stable-diffusion-v1-5"
-
+    val_vis_keep: int = 5
     output_dir: str = "./outputs/sr_controlnet"
     lr: float = 1e-5
     train_steps: int = 20000
@@ -41,16 +37,18 @@ class SRTrainConfig:
     mixed_precision: str = "fp16"  # "no" / "fp16" / "bf16"
     save_every: int = 2000
     device: str = "cuda"
-    
-    # VFM control 相关
-    local_dir: str = "./src/models/dinov2_vitb14"  # DINOv2 本地目录（离线）
-    control_scale: float = 0.5  # ControlNet 控制强度比例（越大受控制影响越大）
-    
-    
+
+    # VFM control
+    local_dir: str = "./src/models/dinov2_vitb14"
+
+    # checkpoint
+    save_full_ckpt: bool = False  # True: 保存 optimizer/scaler/step；False: 仅保存 controlnet 权重
+    ckpt_root: str = "checkpoints"  # 子目录名：{output_dir}/{ckpt_root}/step_XXXXXXXX
+
     # validation（step-based）
-    val_every: int = 0        # 0 表示不验证；>0 每 val_every step 验证一次
-    val_batches: int = 10     # 每次验证最多跑多少个 batch
-    sample_steps: int = 20    # validate/sample 时 DDPM 采样步数（越大越慢）
+    val_every: int = 0
+    val_batches: int = 10
+    sample_steps: int = 20  # validate/sample 时 DDPM 采样步数（越大越慢）
 
 
 def make_control_image_from_lr_fallback(lr_up: torch.Tensor) -> torch.Tensor:
@@ -60,13 +58,11 @@ def make_control_image_from_lr_fallback(lr_up: torch.Tensor) -> torch.Tensor:
     return: [B,3,512,512] => (gray, edge, gray)
     """
     gray = lr_up.mean(dim=1, keepdim=True)  # [B,1,H,W]
-
     dx = torch.abs(gray[:, :, :, 1:] - gray[:, :, :, :-1])
     dy = torch.abs(gray[:, :, 1:, :] - gray[:, :, :-1, :])
     dx = F.pad(dx, (0, 1, 0, 0))
     dy = F.pad(dy, (0, 0, 0, 1))
     edge = torch.clamp(dx + dy, 0.0, 1.0)
-
     ctrl = torch.cat([gray, edge, gray], dim=1)
     return ctrl
 
@@ -80,11 +76,11 @@ class DiffusionSRControlNetTrainer:
         self.metrics = SRMetrics(device=self.device)
 
         # ----------------------------
-        # ✅ M1: init DINOv2 control generator
+        # ✅ M1: init DINOv2 control generator (frozen)
         # ----------------------------
         self.vfm_cfg = VFMConfig(
             variant="dinov2_vitb14",
-            local_dir=cfg.local_dir,  # 你指定的 base 权重目录
+            local_dir=cfg.local_dir,
             image_size=518,
             patch_size=14,
             control_mode="energy_edge_gray",
@@ -95,7 +91,7 @@ class DiffusionSRControlNetTrainer:
         print(f"[VFM] enabled: {self.vfm_cfg.variant} | local_dir={self.vfm_cfg.local_dir}")
 
         # ----------------------------
-        # SD1.5 components (repo_id or local dir)
+        # SD1.5 components
         # ----------------------------
         self.tokenizer = CLIPTokenizer.from_pretrained(
             cfg.pretrained_sd15, subfolder="tokenizer", token=token
@@ -110,14 +106,14 @@ class DiffusionSRControlNetTrainer:
             cfg.pretrained_sd15, subfolder="unet", token=token
         ).to(self.device)
 
-        # ControlNet initialized from UNet weights
+        # ControlNet init from UNet
         self.controlnet = ControlNetModel.from_unet(self.unet).to(self.device)
 
         self.noise_scheduler = DDPMScheduler.from_pretrained(
             cfg.pretrained_sd15, subfolder="scheduler", token=token
         )
 
-        # Freeze base
+        # freeze base
         self.vae.requires_grad_(False)
         self.unet.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
@@ -125,18 +121,22 @@ class DiffusionSRControlNetTrainer:
         self.unet.eval()
         self.text_encoder.eval()
 
-        # Train only ControlNet
+        # train controlnet only
         self.controlnet.train()
         self.optimizer = AdamW(self.controlnet.parameters(), lr=float(cfg.lr))
 
         # AMP
         self.use_amp = (cfg.mixed_precision in ("fp16", "bf16"))
         self.autocast_dtype = torch.float16 if cfg.mixed_precision == "fp16" else torch.bfloat16
+        # ✅ torch.amp.GradScaler recommended in your env warning
         self.scaler = torch.amp.GradScaler("cuda", enabled=(cfg.mixed_precision == "fp16"))
 
-        # cache empty prompt embeds
+        # cache empty prompt
         self.empty_prompt_embeds = self._encode_text([""])
 
+    # ----------------------------
+    # helpers
+    # ----------------------------
     @torch.no_grad()
     def _encode_text(self, prompts):
         tokens = self.tokenizer(
@@ -150,20 +150,12 @@ class DiffusionSRControlNetTrainer:
 
     @torch.no_grad()
     def _vae_encode(self, x_01: torch.Tensor) -> torch.Tensor:
-        """
-        x_01: [B,3,512,512] in [0,1]
-        returns latents: [B,4,64,64]
-        """
         x = x_01 * 2.0 - 1.0
         latents = self.vae.encode(x).latent_dist.mode()
         return latents * 0.18215
 
     @torch.no_grad()
     def _vae_decode(self, latents: torch.Tensor) -> torch.Tensor:
-        """
-        latents: [B,4,64,64] (scaled)
-        returns img: [B,3,512,512] in [0,1]
-        """
         latents = latents / 0.18215
         img = self.vae.decode(latents).sample
         img = (img + 1.0) / 2.0
@@ -174,60 +166,239 @@ class DiffusionSRControlNetTrainer:
         lr_up_512: [B,3,512,512] in [0,1]
         return: [B,3,512,512] in [0,1]
         """
-        # ✅ 优先用 VFM control；失败则兜底
         try:
-            ctrl = self.ctrl_gen(lr_up_512)
-            # 安全极值
-            ctrl = ctrl.clamp(0, 1)
-            ctrl = ctrl * 0.9 + 0.05
-            
-            return ctrl
+            return self.ctrl_gen(lr_up_512)
         except Exception as e:
             if not self._warned_control_fallback:
                 print(f"[WARN] VFM control failed once, fallback to lr-edge control. err={e}")
                 self._warned_control_fallback = True
             return make_control_image_from_lr_fallback(lr_up_512)
 
-    def save(self, step: int):
-        out = os.path.join(self.cfg.output_dir, f"controlnet_step_{step}")
-        os.makedirs(out, exist_ok=True)
-        self.controlnet.save_pretrained(out)
-        print(f"[save] controlnet saved to {out}")
+    # ----------------------------
+    # checkpoint utils
+    # ----------------------------
+    def _ckpt_root_dir(self) -> str:
+        return os.path.join(self.cfg.output_dir, getattr(self.cfg, "ckpt_root", "checkpoints"))
 
-    def train(self, train_loader, val_loader=None):
+    def _ckpt_dir(self, step: int) -> str:
+        return os.path.join(self._ckpt_root_dir(), f"step_{step:08d}")
+
+    def _find_latest_checkpoint(self) -> Optional[str]:
+        ckpt_root = self._ckpt_root_dir()
+        if not os.path.isdir(ckpt_root):
+            return None
+
+        step_re = re.compile(r"^step_(\d+)$")
+        best_step = -1
+        best_dir = None
+
+        for name in os.listdir(ckpt_root):
+            m = step_re.match(name)
+            if not m:
+                continue
+            step = int(m.group(1))
+            d = os.path.join(ckpt_root, name)
+
+            # must have controlnet weights
+            if not os.path.isdir(os.path.join(d, "controlnet")):
+                continue
+
+            # if full ckpt, must have trainer_state.pt
+            if getattr(self.cfg, "save_full_ckpt", False):
+                if not os.path.isfile(os.path.join(d, "trainer_state.pt")):
+                    continue
+
+            if step > best_step:
+                best_step = step
+                best_dir = d
+
+        return best_dir
+
+    def _prune_val_vis(self):
+        keep = int(getattr(self.cfg, "val_vis_keep", 0) or 0)
+        if keep <= 0:
+            return
+
+        vis_base = os.path.join(self.cfg.output_dir, "val_vis")
+        if not os.path.isdir(vis_base):
+            return
+
+        step_re = re.compile(r"^step_(\d+)$")
+        items = []
+        for name in os.listdir(vis_base):
+            m = step_re.match(name)
+            if not m:
+                continue
+            step = int(m.group(1))
+            d = os.path.join(vis_base, name)
+            if os.path.isdir(d):
+                items.append((step, d))
+
+        # 少于等于 keep，无需清理
+        if len(items) <= keep:
+            return
+
+        # 按 step 从小到大排序，删最旧的
+        items.sort(key=lambda x: x[0])
+        to_delete = items[: max(0, len(items) - keep)]
+
+        for step, d in to_delete:
+            try:
+                shutil.rmtree(d)
+                print(f"[val_vis] pruned old vis: step={step} dir={d}")
+            except Exception as e:
+                print(f"[WARN] failed to prune val_vis dir={d}: {e}")
+    
+    def save_checkpoint(self, step: int):
+        ckpt_dir = self._ckpt_dir(step)
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        # 1) controlnet
+        self.controlnet.save_pretrained(os.path.join(ckpt_dir, "controlnet"))
+
+        # 2) full state
+        if getattr(self.cfg, "save_full_ckpt", False):
+            payload = {
+                "global_step": int(step),
+                "optimizer": self.optimizer.state_dict(),
+                "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+            }
+            torch.save(payload, os.path.join(ckpt_dir, "trainer_state.pt"))
+
+        # 3) meta
+        with open(os.path.join(ckpt_dir, "meta.json"), "w") as f:
+            json.dump({"global_step": int(step)}, f, indent=2)
+
+        print(f"[ckpt] saved checkpoint to {ckpt_dir}")
+
+    def load_checkpoint(self, ckpt_dir: str, strict_full: bool = True) -> int:
+        """
+        ckpt_dir: .../step_XXXXXXXX
+        strict_full:
+          - True: 如果 cfg.save_full_ckpt=True，则要求 trainer_state.pt 存在
+          - False: 只要 controlnet 存在就能加载（用于“加载权重继续训但不恢复优化器”）
+        return: global_step
+        """
+        if not ckpt_dir or (not os.path.isdir(ckpt_dir)):
+            raise FileNotFoundError(f"ckpt_dir not found: {ckpt_dir}")
+
+        controlnet_dir = os.path.join(ckpt_dir, "controlnet")
+        if not os.path.isdir(controlnet_dir):
+            raise FileNotFoundError(f"controlnet dir missing: {controlnet_dir}")
+
+        # 1) load controlnet weights (replace module)
+        self.controlnet = ControlNetModel.from_pretrained(controlnet_dir).to(self.device)
+        self.controlnet.train()
+
+        # 2) IMPORTANT: rebuild optimizer to bind NEW controlnet params
+        self.optimizer = AdamW(self.controlnet.parameters(), lr=float(self.cfg.lr))
+
+        # default step from folder name
+        m = re.search(r"step_(\d+)", os.path.basename(ckpt_dir))
+        global_step = int(m.group(1)) if m else 0
+
+        # 3) load full state if available/wanted
+        state_path = os.path.join(ckpt_dir, "trainer_state.pt")
+        if os.path.exists(state_path):
+            payload = torch.load(state_path, map_location="cpu")
+            global_step = int(payload.get("global_step", global_step))
+
+            if payload.get("optimizer", None) is not None:
+                self.optimizer.load_state_dict(payload["optimizer"])
+
+            if payload.get("scaler", None) is not None and self.scaler is not None:
+                try:
+                    self.scaler.load_state_dict(payload["scaler"])
+                except Exception as e:
+                    print(f"[WARN] scaler state load failed, will reset scaler. err={e}")
+        else:
+            if getattr(self.cfg, "save_full_ckpt", False) and strict_full:
+                raise FileNotFoundError(f"trainer_state.pt missing: {state_path}")
+            print("[ckpt] trainer_state.pt not found, loaded weights only (optimizer/scaler reset).")
+
+        print(f"[ckpt] loaded from {ckpt_dir}, resume global_step={global_step}")
+        return global_step
+
+    # ----------------------------
+    # training
+    # ----------------------------
+    def train(self, train_loader, val_loader=None, resume_ckpt: Optional[str] = None):
         cfg = self.cfg
+
+        # -------------------------
+        # resume (user-specified > auto-latest > none)
+        # -------------------------
         global_step = 0
+        ckpt_used = None
 
-        do_val = (val_loader is not None) and (getattr(cfg, "val_every", 0) and int(cfg.val_every) > 0)
-        val_every = int(getattr(cfg, "val_every", 0))
-        val_batches = int(getattr(cfg, "val_batches", 10))
+        if resume_ckpt:  # user specified
+            ckpt_used = resume_ckpt
+        else:
+            ckpt_used = self._find_latest_checkpoint()
 
-        pbar = tqdm(total=cfg.train_steps, desc="train", unit="step")
+        if ckpt_used:
+            try:
+                # 如果你开启 save_full_ckpt=True，默认严格恢复；否则就只是加载权重
+                strict_full = bool(getattr(cfg, "save_full_ckpt", False))
+                global_step = int(self.load_checkpoint(ckpt_used, strict_full=strict_full))
+            except Exception as e:
+                print(f"[WARN] resume failed from {ckpt_used}. Start from scratch. err={e}")
+                global_step = 0
+        else:
+            print("[ckpt] no checkpoint found. Start from scratch.")
+
+        if global_step >= int(cfg.train_steps):
+            print(f"[WARN] global_step({global_step}) >= train_steps({cfg.train_steps}). Nothing to train.")
+            return
+
+        # -------------------------
+        # validation schedule
+        # -------------------------
+        val_every = int(getattr(cfg, "val_every", 0) or 0)
+        val_batches = int(getattr(cfg, "val_batches", 10) or 10)
+        do_val = (val_loader is not None) and (val_every > 0)
+
+        # -------------------------
+        # progress bar
+        # -------------------------
+        pbar = tqdm(
+            total=int(cfg.train_steps),
+            desc="train",
+            unit="step",
+            initial=int(global_step),
+        )
+
         data_iter = iter(train_loader)
 
-        while global_step < cfg.train_steps:
+        # -------------------------
+        # main loop
+        # -------------------------
+        while global_step < int(cfg.train_steps):
             try:
                 batch = next(data_iter)
             except StopIteration:
                 data_iter = iter(train_loader)
                 batch = next(data_iter)
 
-            # Expect batch keys: lr, hr
             lr = batch["lr"].to(self.device, non_blocking=True)  # [B,3,128,128]
             hr = batch["hr"].to(self.device, non_blocking=True)  # [B,3,512,512]
 
-            # build control internally (M1: DINOv2)
+            # control
             lr_up = F.interpolate(lr, size=(512, 512), mode="bicubic", align_corners=False)
             control_image = self._build_control(lr_up)  # [B,3,512,512]
 
+            # target latents
             with torch.no_grad():
-                latents = self._vae_encode(hr)  # x0 latents
+                latents = self._vae_encode(hr)
 
             bsz = latents.shape[0]
             noise = torch.randn_like(latents)
             timesteps = torch.randint(
-                0, self.noise_scheduler.config.num_train_timesteps,
-                (bsz,), device=self.device, dtype=torch.long
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                (bsz,),
+                device=self.device,
+                dtype=torch.long,
             )
             noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
@@ -241,10 +412,6 @@ class DiffusionSRControlNetTrainer:
                     controlnet_cond=control_image,
                     return_dict=False,
                 )
-                
-                scale = float(getattr(self.cfg, "control_scale", 1.0))
-                down_samples = [d * scale for d in down_samples]
-                mid_sample = mid_sample * scale
 
                 noise_pred = self.unet(
                     noisy_latents,
@@ -255,7 +422,7 @@ class DiffusionSRControlNetTrainer:
                     return_dict=False,
                 )[0]
 
-                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean") / cfg.grad_accum
+                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean") / int(cfg.grad_accum)
 
             # backward
             if cfg.mixed_precision == "fp16":
@@ -263,19 +430,24 @@ class DiffusionSRControlNetTrainer:
             else:
                 loss.backward()
 
-            if (global_step + 1) % cfg.grad_accum == 0:
+            # optimizer step (grad accum)
+            if (global_step + 1) % int(cfg.grad_accum) == 0:
                 if cfg.mixed_precision == "fp16":
+                    # ✅ 关键修复：显式 unscale_，避免 “No inf checks were recorded”
+                    self.scaler.unscale_(self.optimizer)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     self.optimizer.step()
+
                 self.optimizer.zero_grad(set_to_none=True)
 
+            # step update
             global_step += 1
             pbar.update(1)
             pbar.set_postfix({"loss": float(loss.detach().cpu())})
 
-            # periodic validation
+            # validation
             if do_val and (global_step % val_every == 0):
                 try:
                     metrics = self.validate(val_loader, step=global_step, max_batches=val_batches)
@@ -285,23 +457,21 @@ class DiffusionSRControlNetTrainer:
                 except Exception as e:
                     print(f"[WARN] validate failed at step={global_step}: {e}")
 
-            # periodic checkpoint
-            if (global_step % cfg.save_every) == 0:
-                self.save(global_step)
+            # checkpoint
+            if (global_step % int(cfg.save_every) == 0):
+                self.save_checkpoint(global_step)
 
         pbar.close()
-        self.save(global_step)
+        self.save_checkpoint(global_step)
 
+    # ----------------------------
+    # sampling
+    # ----------------------------
     @torch.no_grad()
     def sample_sr(self, lr: torch.Tensor, num_steps: Optional[int] = None) -> torch.Tensor:
-        """
-        lr: [B,3,128,128] in [0,1]
-        return sr: [B,3,512,512] in [0,1]
-        """
         self.controlnet.eval()
 
         num_steps = int(num_steps or getattr(self.cfg, "sample_steps", 20))
-
         lr_up = F.interpolate(lr, size=(512, 512), mode="bicubic", align_corners=False)
         control = self._build_control(lr_up)
 
@@ -320,10 +490,6 @@ class DiffusionSRControlNetTrainer:
                 controlnet_cond=control,
                 return_dict=False,
             )
-            
-            scale = float(getattr(self.cfg, "control_scale", 1.0))
-            down = [d * scale for d in down]
-            mid = mid * scale
 
             noise_pred = self.unet(
                 latents,
@@ -337,50 +503,44 @@ class DiffusionSRControlNetTrainer:
             latents = self.noise_scheduler.step(noise_pred, t, latents).prev_sample
 
         sr = self._vae_decode(latents)
-
         self.controlnet.train()
         return sr
 
-    
+    # ----------------------------
+    # validation + save SR/GT/control
+    # ----------------------------
     @torch.no_grad()
-    def validate(self, val_loader, step: int = 0, max_batches: int = 10):
-
+    def validate(self, val_loader, step: int = 0, max_batches: int = 10) -> Dict[str, float]:
         self.controlnet.eval()
 
         psnr_list, ssim_list, lpips_list, stlpips_list = [], [], [], []
 
-        # ---- choose a random batch index for visualization ----
+        # save one random example
         save_vis = True
         vis_batch_idx = np.random.randint(0, max(1, int(max_batches)))
         vis_saved = False
 
-        # ---- prepare output folder ----
         vis_root = os.path.join(self.cfg.output_dir, "val_vis", f"step_{step:07d}")
         os.makedirs(vis_root, exist_ok=True)
 
-        # helper: tensor [3,H,W] -> uint8 HWC
         def to_u8(img_3chw: torch.Tensor) -> np.ndarray:
             x = img_3chw.detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy()
             x = (x * 255.0 + 0.5).astype(np.uint8)
             return x
 
-        # sample steps
         num_steps = int(getattr(self.cfg, "sample_steps", 20))
 
         for i, batch in enumerate(val_loader):
             if i >= int(max_batches):
                 break
 
-            lr = batch["lr"].to(self.device, non_blocking=True)  # [B,3,128,128]
-            hr = batch["hr"].to(self.device, non_blocking=True)  # [B,3,512,512]
+            lr = batch["lr"].to(self.device, non_blocking=True)
+            hr = batch["hr"].to(self.device, non_blocking=True)
 
-            # ---- build lr_up + control (must be 512!) ----
-            lr_up = torch.nn.functional.interpolate(
-                lr, size=(512, 512), mode="bicubic", align_corners=False
-            )
-            control = self._build_control(lr_up)  # ✅ [B,3,512,512]
+            lr_up = F.interpolate(lr, size=(512, 512), mode="bicubic", align_corners=False)
+            control = self._build_control(lr_up)
 
-            # ---- diffusion sampling (inline, DO NOT call sample_sr to avoid state flips) ----
+            # inline sampling (avoid state flips)
             B = lr.shape[0]
             latents = torch.randn((B, 4, 64, 64), device=self.device)
 
@@ -388,7 +548,6 @@ class DiffusionSRControlNetTrainer:
 
             for t in self.noise_scheduler.timesteps:
                 encoder_hidden_states = self.empty_prompt_embeds.repeat(B, 1, 1)
-
                 down, mid = self.controlnet(
                     latents,
                     t,
@@ -396,7 +555,6 @@ class DiffusionSRControlNetTrainer:
                     controlnet_cond=control,
                     return_dict=False,
                 )
-
                 noise_pred = self.unet(
                     latents,
                     t,
@@ -405,18 +563,17 @@ class DiffusionSRControlNetTrainer:
                     mid_block_additional_residual=mid,
                     return_dict=False,
                 )[0]
-
                 latents = self.noise_scheduler.step(noise_pred, t, latents).prev_sample
 
-            sr = self._vae_decode(latents)  # [B,3,512,512] in [0,1]
+            sr = self._vae_decode(latents)
 
-            # ---- metrics ----
+            # metrics
             psnr_list.append(float(self.metrics.psnr(sr, hr)))
             ssim_list.append(float(self.metrics.ssim(sr, hr)))
             lpips_list.append(float(self.metrics.lpips(sr, hr)))
             stlpips_list.append(float(self.metrics.shift_tolerant_lpips(sr, hr)))
 
-            # ---- save one random example ----
+            # save one example
             if save_vis and (not vis_saved) and (i == vis_batch_idx):
                 j = int(np.random.randint(0, B))
 
@@ -437,7 +594,9 @@ class DiffusionSRControlNetTrainer:
 
                 vis_saved = True
                 print(f"[val] saved SR/GT/LR_up/CONTROL to: {vis_root}")
+                self._prune_val_vis()
 
+                
         self.controlnet.train()
 
         results = {

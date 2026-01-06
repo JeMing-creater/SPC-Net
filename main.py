@@ -85,7 +85,8 @@ if __name__ == "__main__":
         patch_level=config.data_loader.patch_level,
         down_scale=config.data_loader.down_scale,
         min_tissue_ratio = config.data_loader.min_tissue_ratio,
-        seed=config.data_loader.seed
+        seed=config.data_loader.seed,
+        limit_samples = config.data_loader.patch_num
     )
     
     
@@ -116,6 +117,8 @@ if __name__ == "__main__":
         val_batches=int(getattr(config.sr, "val_batches", 10)),
         sample_steps=int(getattr(config.sr, "sample_steps", 20)),
         local_dir=getattr(config.sr.vfm, "local_dir", "./src/models/dinov2_vitb14"),
+        save_full_ckpt=getattr(config.sr, "save_full_ckpt", False),
+        val_vis_keep=getattr(config.sr, "val_vis_keep", 5),
     )
     trainer = DiffusionSRControlNetTrainer(tcfg, token=getattr(config.sr, "token", None))
-    trainer.train(train_loader, val_loader=val_loader)
+    trainer.train(train_loader, val_loader=val_loader, resume_ckpt=(config.sr.resume_ckpt if config.sr.resume_ckpt != "" else None))
