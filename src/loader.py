@@ -73,15 +73,31 @@ class ClinicalSurvivalIndex:
 
         row = self.df.loc[case_id]
 
-        if self.death_col in self.df.columns:
+        # Prefer vital_status when available
+        vital = None
+        if "vital_status" in self.df.columns:
+            vital = str(row.get("vital_status", "")).strip().lower()
+
+        if vital in ("dead", "deceased"):
             t = _safe_float(row.get(self.death_col, None))
             if t is not None:
                 return SurvivalInfo(time=t, event=1)
+            return None
 
-        if self.follow_col in self.df.columns:
+        if vital in ("alive", "living"):
             t = _safe_float(row.get(self.follow_col, None))
             if t is not None:
                 return SurvivalInfo(time=t, event=0)
+            return None
+
+        # Fallback: old behavior
+        t = _safe_float(row.get(self.death_col, None)) if self.death_col in self.df.columns else None
+        if t is not None:
+            return SurvivalInfo(time=t, event=1)
+
+        t = _safe_float(row.get(self.follow_col, None)) if self.follow_col in self.df.columns else None
+        if t is not None:
+            return SurvivalInfo(time=t, event=0)
 
         return None
 
@@ -261,6 +277,7 @@ class PathologySRSurvivalDataset(Dataset):
                 "slide_id": it["slide_id"],
                 "lr_path": it["lr_path"],
                 "hr_path": it["hr_path"],
+                "surv_key": f"{it['case_id']}|{it['time']:.1f}|{it['event']}"
             },
         }
         
@@ -400,49 +417,4 @@ if __name__ == "__main__":
     x = ds[0]
     print(x["lr"].shape, x["hr"].shape, x["time"], x["event"])
     
-    # train_loader, val_loader, test_loader = build_case_split_dataloaders(
-    #     out_img_dir=config.data_loader.out_img_dir,
-    #     batch_size=config.trainer.batch_size,
-    #     patch_num=getattr(config.data_loader, "patch_num", 200),
-    #     train_ratio=config.data_loader.train_ratio,
-    #     val_ratio=config.data_loader.val_ratio,
-    #     test_ratio=config.data_loader.test_ratio,
-    #     split_seed=getattr(config.data_loader, "split_seed", 2025),
-    #     num_workers=config.data_loader.num_workers,
-    #     pin_memory=config.data_loader.pin_memory,
-    # )
-
-    # train_num = 0
-    # val_num = 0
-    # teat_num = 0
-    
-    # for batch in train_loader:
-    #     lr = batch["lr"]        # [B, 3, h, w]
-    #     hr = batch["hr"]        # [B, 3, H, W]
-    #     time = batch["time"]    # [B]
-    #     event = batch["event"]  # [B]
-    #     meta = batch["meta"]
-    #     print(lr.shape, hr.shape, time[:3], event[:3])
-    #     train_num += 1
-    #     # break
-    
-    # for batch in val_loader:
-    #     lr = batch["lr"]        # [B, 3, h, w]
-    #     hr = batch["hr"]        # [B, 3, H, W]
-    #     time = batch["time"]    # [B]
-    #     event = batch["event"]  # [B]
-    #     meta = batch["meta"]
-    #     print(lr.shape, hr.shape, time[:3], event[:3])
-    #     val_num += 1
-    
-    # for batch in test_loader:
-    #     lr = batch["lr"]        # [B, 3, h, w]
-    #     hr = batch["hr"]        # [B, 3, H, W]
-    #     time = batch["time"]    # [B]
-    #     event = batch["event"]  # [B]
-    #     meta = batch["meta"]
-    #     print(lr.shape, hr.shape, time[:3], event[:3])
-    #     teat_num += 1
-    
-    # print(f"train batches: {train_num}, val batches: {val_num}, test batches: {teat_num}")
     

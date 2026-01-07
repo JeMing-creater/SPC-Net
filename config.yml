@@ -19,10 +19,6 @@ data_loader:
   min_tissue_ratio: 0.8 # 设定切片时的最小组织比例
   patch_level: 0  # 设定切片时所用的层级, 0 通常是最高分辨率, 40x
 
-# sam:
-#   ckpt: ./src/model/sam_vit_h_4b8939.pth
-#   model_type: vit_h
-#   device: cuda
 
 sr:
   pretrained_sd15: runwayml/stable-diffusion-v1-5   # 或者本地路径 /mnt/liangjm/models/sd15
@@ -57,12 +53,12 @@ sr:
 
 TCGA_LUAD:
   root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-LUAD/
-  choose_WSI: 50
+  choose_WSI: 10
 
 TCGA_KIRC:
   root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-KIRC/
-  choose_WSI: 50
+  choose_WSI: 10
 
 TCGA_LIHC:
   root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-LIHC/
-  choose_WSI: 50
+  choose_WSI: 10
