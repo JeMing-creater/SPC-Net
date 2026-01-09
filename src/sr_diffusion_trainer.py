@@ -189,6 +189,17 @@ class DiffusionSRControlNetTrainer:
         if not os.path.isdir(ckpt_root):
             return None
 
+        # ✅ New: prefer "latest" dir (single latest checkpoint)
+        latest_dir = os.path.join(ckpt_root, "latest")
+        if os.path.isdir(os.path.join(latest_dir, "controlnet")):
+            # if full ckpt required, check trainer_state.pt
+            if getattr(self.cfg, "save_full_ckpt", False):
+                if os.path.isfile(os.path.join(latest_dir, "trainer_state.pt")):
+                    return latest_dir
+            else:
+                return latest_dir
+
+        # Fallback: legacy step_XXXXXXXX dirs (keep for backward compatibility)
         step_re = re.compile(r"^step_(\d+)$")
         best_step = -1
         best_dir = None
@@ -200,11 +211,9 @@ class DiffusionSRControlNetTrainer:
             step = int(m.group(1))
             d = os.path.join(ckpt_root, name)
 
-            # must have controlnet weights
             if not os.path.isdir(os.path.join(d, "controlnet")):
                 continue
 
-            # if full ckpt, must have trainer_state.pt
             if getattr(self.cfg, "save_full_ckpt", False):
                 if not os.path.isfile(os.path.join(d, "trainer_state.pt")):
                     continue
@@ -214,6 +223,7 @@ class DiffusionSRControlNetTrainer:
                 best_dir = d
 
         return best_dir
+
 
     def _prune_val_vis(self):
         keep = int(getattr(self.cfg, "val_vis_keep", 0) or 0)
@@ -250,14 +260,23 @@ class DiffusionSRControlNetTrainer:
             except Exception as e:
                 print(f"[WARN] failed to prune val_vis dir={d}: {e}")
     
-    def save_checkpoint(self, step: int):
-        ckpt_dir = self._ckpt_dir(step)
+    def save_checkpoint(self, step: int, ckpt_name: str = "latest", extra_meta: Optional[Dict] = None):
+        """
+        ckpt_name:
+        - "latest": ✅ always overwrite, keep only the newest checkpoint
+        - "best"  : ✅ overwrite when best PSNR improves
+        - legacy/other: still supported, will write to {ckpt_root}/{ckpt_name}
+        """
+        ckpt_root = self._ckpt_root_dir()
+        os.makedirs(ckpt_root, exist_ok=True)
+
+        ckpt_dir = os.path.join(ckpt_root, str(ckpt_name))
         os.makedirs(ckpt_dir, exist_ok=True)
 
         # 1) controlnet
         self.controlnet.save_pretrained(os.path.join(ckpt_dir, "controlnet"))
 
-        # 2) full state
+        # 2) full state (optional)
         if getattr(self.cfg, "save_full_ckpt", False):
             payload = {
                 "global_step": int(step),
@@ -267,10 +286,14 @@ class DiffusionSRControlNetTrainer:
             torch.save(payload, os.path.join(ckpt_dir, "trainer_state.pt"))
 
         # 3) meta
-        with open(os.path.join(ckpt_dir, "meta.json"), "w") as f:
-            json.dump({"global_step": int(step)}, f, indent=2)
+        meta = {"global_step": int(step), "ckpt_name": str(ckpt_name)}
+        if isinstance(extra_meta, dict):
+            meta.update(extra_meta)
 
-        print(f"[ckpt] saved checkpoint to {ckpt_dir}")
+        with open(os.path.join(ckpt_dir, "meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+        print(f"[ckpt] saved ({ckpt_name}) checkpoint to {ckpt_dir}")
 
     def load_checkpoint(self, ckpt_dir: str, strict_full: bool = True) -> int:
         """
@@ -339,7 +362,6 @@ class DiffusionSRControlNetTrainer:
 
         if ckpt_used:
             try:
-                # 如果你开启 save_full_ckpt=True，默认严格恢复；否则就只是加载权重
                 strict_full = bool(getattr(cfg, "save_full_ckpt", False))
                 global_step = int(self.load_checkpoint(ckpt_used, strict_full=strict_full))
             except Exception as e:
@@ -351,6 +373,26 @@ class DiffusionSRControlNetTrainer:
         if global_step >= int(cfg.train_steps):
             print(f"[WARN] global_step({global_step}) >= train_steps({cfg.train_steps}). Nothing to train.")
             return
+
+        # -------------------------
+        # best PSNR state (persisted)
+        # -------------------------
+        ckpt_root = self._ckpt_root_dir()
+        best_state_path = os.path.join(ckpt_root, "best_score.json")
+        best_psnr = float("-inf")
+        best_step = -1
+        if os.path.isfile(best_state_path):
+            try:
+                with open(best_state_path, "r") as f:
+                    d = json.load(f)
+                best_psnr = float(d.get("best_psnr", best_psnr))
+                best_step = int(d.get("best_step", best_step))
+                print(f"[best] loaded best_psnr={best_psnr:.6f} @ step={best_step}")
+            except Exception as e:
+                print(f"[WARN] failed to read best_score.json, reset best. err={e}")
+
+        self.best_psnr = best_psnr
+        self.best_step = best_step
 
         # -------------------------
         # validation schedule
@@ -434,7 +476,6 @@ class DiffusionSRControlNetTrainer:
             # optimizer step (grad accum)
             if (global_step + 1) % int(cfg.grad_accum) == 0:
                 if cfg.mixed_precision == "fp16":
-                    # ✅ 关键修复：显式 unscale_，避免 “No inf checks were recorded”
                     self.scaler.unscale_(self.optimizer)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
@@ -448,7 +489,7 @@ class DiffusionSRControlNetTrainer:
             pbar.update(1)
             pbar.set_postfix({"loss": float(loss.detach().cpu())})
 
-            # validation
+            # validation (also handles best checkpoint inside validate)
             if do_val and (global_step % val_every == 0):
                 try:
                     metrics = self.validate(val_loader, step=global_step, max_batches=val_batches)
@@ -458,12 +499,13 @@ class DiffusionSRControlNetTrainer:
                 except Exception as e:
                     print(f"[WARN] validate failed at step={global_step}: {e}")
 
-            # checkpoint
+            # ✅ checkpoint: keep only latest (overwrite)
             if (global_step % int(cfg.save_every) == 0):
-                self.save_checkpoint(global_step)
+                self.save_checkpoint(global_step, ckpt_name="latest")
 
         pbar.close()
-        self.save_checkpoint(global_step)
+        # ✅ final save: overwrite latest
+        self.save_checkpoint(global_step, ckpt_name="latest")
 
     # ----------------------------
     # sampling
@@ -597,7 +639,6 @@ class DiffusionSRControlNetTrainer:
                 print(f"[val] saved SR/GT/LR_up/CONTROL to: {vis_root}")
                 self._prune_val_vis()
 
-                
         self.controlnet.train()
 
         results = {
@@ -614,5 +655,29 @@ class DiffusionSRControlNetTrainer:
             f"LPIPS={results['LPIPS']:.4f} | "
             f"ST-LPIPS={results['ST-LPIPS']:.4f}"
         )
+
+        # ✅ Always overwrite "latest" checkpoint (keep only newest)
+        try:
+            self.save_checkpoint(step, ckpt_name="latest", extra_meta={"val_metrics": results})
+        except Exception as e:
+            print(f"[WARN] failed to save latest ckpt at val step={step}: {e}")
+
+        # ✅ Save best by PSNR (overwrite "best" only when improved)
+        try:
+            cur_psnr = float(results.get("PSNR", 0.0))
+            best_psnr = float(getattr(self, "best_psnr", float("-inf")))
+            if cur_psnr > best_psnr:
+                self.best_psnr = cur_psnr
+                self.best_step = int(step)
+
+                self.save_checkpoint(step, ckpt_name="best", extra_meta={"best_psnr": cur_psnr, "best_step": int(step)})
+
+                best_state_path = os.path.join(self._ckpt_root_dir(), "best_score.json")
+                with open(best_state_path, "w") as f:
+                    json.dump({"best_psnr": float(cur_psnr), "best_step": int(step)}, f, indent=2)
+
+                print(f"[best] updated best checkpoint: PSNR={cur_psnr:.6f} @ step={step}")
+        except Exception as e:
+            print(f"[WARN] best checkpoint update failed at step={step}: {e}")
 
         return results
