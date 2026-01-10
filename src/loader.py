@@ -102,6 +102,66 @@ class ClinicalSurvivalIndex:
         return None
 
 
+
+def build_survival_map(
+    df: pd.DataFrame,
+    id_col: str = "case_submitter_id",
+    death_col: str = "days_to_death",
+    follow_col: str = "days_to_last_follow_up",
+) -> Dict[str, SurvivalInfo]:
+    """
+    Build {case_id -> SurvivalInfo(time, event)} from clinical.tsv DataFrame.
+
+    - If vital_status exists:
+        dead/deceased -> use days_to_death, event=1
+        alive/living  -> use days_to_last_follow_up, event=0
+    - Else fallback:
+        if days_to_death valid -> event=1
+        elif days_to_last_follow_up valid -> event=0
+    """
+    if id_col not in df.columns:
+        raise ValueError(f"clinical.tsv missing column: {id_col}")
+    if (death_col not in df.columns) and (follow_col not in df.columns):
+        raise ValueError(f"clinical.tsv missing both: {death_col}, {follow_col}")
+
+    out: Dict[str, SurvivalInfo] = {}
+
+    has_vital = "vital_status" in df.columns
+    for _, row in df.iterrows():
+        case_id = str(row[id_col])
+
+        vital = None
+        if has_vital:
+            vital = str(row.get("vital_status", "")).strip().lower()
+
+        # preferred branch if vital_status available
+        if vital in ("dead", "deceased"):
+            t = _safe_float(row.get(death_col, None))
+            if t is not None:
+                out[case_id] = SurvivalInfo(time=t, event=1)
+            continue
+
+        if vital in ("alive", "living"):
+            t = _safe_float(row.get(follow_col, None))
+            if t is not None:
+                out[case_id] = SurvivalInfo(time=t, event=0)
+            continue
+
+        # fallback
+        t = _safe_float(row.get(death_col, None)) if death_col in df.columns else None
+        if t is not None:
+            out[case_id] = SurvivalInfo(time=t, event=1)
+            continue
+
+        t = _safe_float(row.get(follow_col, None)) if follow_col in df.columns else None
+        if t is not None:
+            out[case_id] = SurvivalInfo(time=t, event=0)
+            continue
+
+    return out
+
+
+
 def _list_pngs(folder: str) -> List[str]:
     return sorted(glob.glob(os.path.join(folder, "*.png")))
 
@@ -139,11 +199,14 @@ class PathologySRSurvivalDataset(Dataset):
         patch_num: int = 200,
         transform_lr=None,
         transform_hr=None,
+        disc_root: Optional[str] = None,  # discrepancy map root
     ):
         self.out_img_dir = out_img_dir
         self.hr_root = os.path.join(out_img_dir, "hr_png")
         self.lr_root = os.path.join(out_img_dir, "lr_png")
         self.clin_path = os.path.join(out_img_dir, "clinical.tsv")
+
+        self.disc_root = disc_root or os.path.join(out_img_dir, "disc_maps")
 
         if not os.path.isdir(self.hr_root):
             raise FileNotFoundError(f"hr_png not found: {self.hr_root}")
@@ -152,21 +215,167 @@ class PathologySRSurvivalDataset(Dataset):
         if not os.path.exists(self.clin_path):
             raise FileNotFoundError(f"clinical.tsv not found: {self.clin_path}")
 
-        self.surv_index = ClinicalSurvivalIndex(
-            clin_path=self.clin_path,
-            id_col=id_col,
-            death_col=death_col,
-            follow_col=follow_col,
+        self.require_done = bool(require_done)
+        self.patch_num = int(patch_num)
+
+        if transform_lr is None:
+            self.transform_lr = transforms.Compose([transforms.ToTensor()])
+        else:
+            self.transform_lr = transform_lr
+
+        if transform_hr is None:
+            self.transform_hr = transforms.Compose([transforms.ToTensor()])
+        else:
+            self.transform_hr = transform_hr
+
+        # --- load survival table ---
+        df = pd.read_csv(self.clin_path, sep="\t")
+        surv_map = build_survival_map(df, id_col=id_col, death_col=death_col, follow_col=follow_col)
+
+        # --- detect folder layout ---
+        # Layout A: hr_png/<case>/<slide>/*.png
+        # Layout B: hr_png/<slide>/*.png
+        first_level = sorted([d for d in os.listdir(self.hr_root) if os.path.isdir(os.path.join(self.hr_root, d))])
+
+        def _dir_has_pngs(d: str) -> bool:
+            try:
+                for f in os.listdir(d):
+                    if f.lower().endswith(".png"):
+                        return True
+            except Exception:
+                return False
+            return False
+
+        layout_is_slide_level = False
+        # heuristic: if any first-level dir directly contains png => slide-level
+        for name in first_level[: min(20, len(first_level))]:
+            if _dir_has_pngs(os.path.join(self.hr_root, name)):
+                layout_is_slide_level = True
+                break
+
+        self.items = []
+        skipped_no_surv = 0
+        skipped_no_hr_slide = 0
+        skipped_no_lr_slide = 0
+        skipped_missing_lr = 0
+        skipped_no_done = 0
+
+        if layout_is_slide_level:
+            # ---------- Layout B: hr_png/<slide_id>/*.png ----------
+            hr_slides = first_level
+            if len(hr_slides) == 0:
+                skipped_no_hr_slide = 1  # just a marker
+            for slide_id in hr_slides:
+                hr_slide_dir = os.path.join(self.hr_root, slide_id)
+                lr_slide_dir = os.path.join(self.lr_root, slide_id)
+
+                if not os.path.isdir(lr_slide_dir):
+                    skipped_no_lr_slide += 1
+                    continue
+
+                if self.require_done and (not _has_done_flag(hr_slide_dir)):
+                    skipped_no_done += 1
+                    continue
+
+                case_id = slide_to_case_id(slide_id)
+                surv = surv_map.get(case_id, None)
+                if surv is None or surv.time is None:
+                    skipped_no_surv += 1
+                    continue
+
+                hr_pngs = sorted([p for p in os.listdir(hr_slide_dir) if p.lower().endswith(".png")])
+                if not hr_pngs:
+                    skipped_no_hr_slide += 1
+                    continue
+                if self.patch_num > 0:
+                    hr_pngs = hr_pngs[: self.patch_num]
+
+                for patch_name in hr_pngs:
+                    hr_path = os.path.join(hr_slide_dir, patch_name)
+                    lr_path = os.path.join(lr_slide_dir, patch_name)
+                    if not os.path.exists(lr_path):
+                        skipped_missing_lr += 1
+                        continue
+
+                    disc_path = os.path.join(self.disc_root, slide_id, patch_name.replace(".png", ".pt"))
+
+                    self.items.append(
+                        {
+                            "case_id": case_id,
+                            "slide_id": slide_id,
+                            "hr_path": hr_path,
+                            "lr_path": lr_path,
+                            "disc_path": disc_path,
+                            "time": surv.time,
+                            "event": surv.event,
+                        }
+                    )
+        else:
+            # ---------- Layout A: hr_png/<case_id>/<slide_id>/*.png ----------
+            hr_cases = first_level
+            for case_id in hr_cases:
+                case_dir = os.path.join(self.hr_root, case_id)
+                if not os.path.isdir(case_dir):
+                    continue
+
+                surv = surv_map.get(case_id, None)
+                if surv is None or surv.time is None:
+                    skipped_no_surv += 1
+                    continue
+
+                slides = sorted([d for d in os.listdir(case_dir) if os.path.isdir(os.path.join(case_dir, d))])
+                if len(slides) == 0:
+                    skipped_no_hr_slide += 1
+                    continue
+
+                for slide_id in slides:
+                    hr_slide_dir = os.path.join(self.hr_root, case_id, slide_id)
+                    lr_slide_dir = os.path.join(self.lr_root, case_id, slide_id)
+
+                    if not os.path.isdir(lr_slide_dir):
+                        skipped_no_lr_slide += 1
+                        continue
+
+                    if self.require_done and (not _has_done_flag(hr_slide_dir)):
+                        skipped_no_done += 1
+                        continue
+
+                    hr_pngs = sorted([p for p in os.listdir(hr_slide_dir) if p.lower().endswith(".png")])
+                    if self.patch_num > 0:
+                        hr_pngs = hr_pngs[: self.patch_num]
+
+                    for patch_name in hr_pngs:
+                        hr_path = os.path.join(hr_slide_dir, patch_name)
+                        lr_path = os.path.join(lr_slide_dir, patch_name)
+                        if not os.path.exists(lr_path):
+                            skipped_missing_lr += 1
+                            continue
+
+                        disc_path = os.path.join(self.disc_root, slide_id, patch_name.replace(".png", ".pt"))
+
+                        self.items.append(
+                            {
+                                "case_id": case_id,
+                                "slide_id": slide_id,
+                                "hr_path": hr_path,
+                                "lr_path": lr_path,
+                                "disc_path": disc_path,
+                                "time": surv.time,
+                                "event": surv.event,
+                            }
+                        )
+
+        print(
+            f"[dataset] layout={'slide_level' if layout_is_slide_level else 'case_level'} | "
+            f"items={len(self.items)} | "
+            f"skipped(no_surv)={skipped_no_surv} | "
+            f"skipped(no_hr_slide)={skipped_no_hr_slide} | "
+            f"skipped(no_lr_slide)={skipped_no_lr_slide} | "
+            f"skipped(no_done)={skipped_no_done} | "
+            f"skipped(missing lr)={skipped_missing_lr} | "
+            f"disc_root={self.disc_root}"
         )
 
-        self.require_done = require_done
-        self.patch_num = int(patch_num) if patch_num is not None else None
-
-        self.transform_lr = transform_lr or transforms.ToTensor()
-        self.transform_hr = transform_hr or transforms.ToTensor()
-
-        self.items: List[Dict[str, Any]] = []
-        self._build_index()
 
     # -------- robust readers --------
     @staticmethod
@@ -181,76 +390,6 @@ class PathologySRSurvivalDataset(Dataset):
             return Image.fromarray(img)
 
 
-    # -------- index builder --------
-    def _build_index(self):
-        slide_dirs = sorted(
-            d for d in os.listdir(self.hr_root)
-            if os.path.isdir(os.path.join(self.hr_root, d))
-        )
-
-        skipped_no_done = 0
-        skipped_no_surv = 0
-        skipped_no_lr_slide = 0
-        skipped_missing_lr = 0
-        kept = 0
-
-        for slide_id in slide_dirs:
-            hr_slide_dir = os.path.join(self.hr_root, slide_id)
-            lr_slide_dir = os.path.join(self.lr_root, slide_id)
-
-            # slide-level filters
-            if self.require_done and (not _has_done_flag(hr_slide_dir)):
-                skipped_no_done += 1
-                continue
-
-            if not os.path.isdir(lr_slide_dir):
-                skipped_no_lr_slide += 1
-                continue
-
-            
-
-            case_id = slide_to_case_id(slide_id)
-            surv = self.surv_index.get(case_id)
-            if surv is None:
-                skipped_no_surv += 1
-                continue
-
-            # patch list from HR
-            hr_pngs = sorted([f for f in os.listdir(hr_slide_dir) if f.endswith(".png")])
-            if not hr_pngs:
-                continue
-
-            if self.patch_num is not None and self.patch_num > 0:
-                hr_pngs = hr_pngs[: self.patch_num]
-
-            for patch_name in hr_pngs:
-                hr_path = os.path.join(hr_slide_dir, patch_name)
-                lr_path = os.path.join(lr_slide_dir, patch_name)
-
-                if not os.path.exists(lr_path):
-                    skipped_missing_lr += 1
-                    continue
-
-                self.items.append(
-                    {
-                        "case_id": case_id,
-                        "slide_id": slide_id,
-                        "hr_path": hr_path,
-                        "lr_path": lr_path,
-                        "time": surv.time,
-                        "event": surv.event,
-                    }
-                )
-                kept += 1
-
-        print(
-            f"[loader] index built: {kept} paired patches | "
-            f"skipped(no .DONE)={skipped_no_done} | "
-            f"skipped(no survival)={skipped_no_surv} | "
-            f"skipped(no lr slide)={skipped_no_lr_slide} | "
-            f"skipped(missing lr)={skipped_missing_lr} | "
-        )
-
     # -------- dataset API --------
     def __len__(self) -> int:
         return len(self.items)
@@ -258,18 +397,50 @@ class PathologySRSurvivalDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         it = self.items[idx]
 
-        lr_img = self._read_rgb_pil_or_cv2(it["lr_path"])     # 128x128
-        hr_img = self._read_rgb_pil_or_cv2(it["hr_path"])     # 512x512
-        
+        lr_img = self._read_rgb_pil_or_cv2(it["lr_path"])  # 128x128 RGB
+        hr_img = self._read_rgb_pil_or_cv2(it["hr_path"])  # 512x512 RGB
 
         lr = self.transform_lr(lr_img)  # [3,128,128] in [0,1]
         hr = self.transform_hr(hr_img)  # [3,512,512] in [0,1]
 
-        
+        disc_path = it.get("disc_path", None)
+        disc_map = None
+        if disc_path is not None and os.path.isfile(disc_path):
+            try:
+                disc_map = torch.load(disc_path, map_location="cpu")
+                if not torch.is_tensor(disc_map):
+                    disc_map = None
+                else:
+                    disc_map = disc_map.float()
 
-        return {
+                    # ensure [1,H,W]
+                    if disc_map.dim() == 2:
+                        disc_map = disc_map.unsqueeze(0)
+                    elif disc_map.dim() == 3 and disc_map.shape[0] != 1:
+                        disc_map = disc_map[:1]
+
+                    # enforce size (512,512)
+                    if disc_map is not None and disc_map.shape[-2:] != (512, 512):
+                        disc_map = torch.nn.functional.interpolate(
+                            disc_map.unsqueeze(0),
+                            size=(512, 512),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(0)
+
+                    # clamp and contiguous for safe GPU transfer/multiply
+                    if disc_map is not None:
+                        disc_map = disc_map.clamp(0, 1).contiguous()
+            except Exception:
+                disc_map = None
+
+        if disc_map is None:
+            disc_map = torch.zeros((1, 512, 512), dtype=torch.float32)
+
+        out = {
             "lr": lr,
             "hr": hr,
+            "disc_map": disc_map,
             "time": torch.tensor(it["time"], dtype=torch.float32),
             "event": torch.tensor(it["event"], dtype=torch.long),
             "meta": {
@@ -277,9 +448,11 @@ class PathologySRSurvivalDataset(Dataset):
                 "slide_id": it["slide_id"],
                 "lr_path": it["lr_path"],
                 "hr_path": it["hr_path"],
-                "surv_key": f"{it['case_id']}|{it['time']:.1f}|{it['event']}"
+                "disc_path": disc_path,
             },
         }
+        return out
+
         
 def _split_cases(
     cases: List[str],
@@ -331,6 +504,7 @@ def build_case_split_dataloaders(
     death_col: str = "days_to_death",
     follow_col: str = "days_to_last_follow_up",
     shuffle_train: bool = True,
+    disc_root: Optional[str] = None,  # ✅ NEW
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Returns: train_loader, val_loader, test_loader
@@ -343,9 +517,9 @@ def build_case_split_dataloaders(
         follow_col=follow_col,
         require_done=require_done,
         patch_num=patch_num,
+        disc_root=disc_root,  # ✅ NEW
     )
 
-    # collect cases that actually appear in dataset items
     cases = sorted({it["case_id"] for it in ds.items})
     if len(cases) == 0:
         raise RuntimeError("No valid cases found after filtering clinical + png pairs.")
@@ -366,12 +540,8 @@ def build_case_split_dataloaders(
     val_idx   = [i for i, it in enumerate(ds.items) if it["case_id"] in val_set]
     test_idx  = [i for i, it in enumerate(ds.items) if it["case_id"] in test_set]
 
-    print(
-        f"[split] cases: total={len(cases)} | train={len(train_cases)} | val={len(val_cases)} | test={len(test_cases)}"
-    )
-    print(
-        f"[split] patches: train={len(train_idx)} | val={len(val_idx)} | test={len(test_idx)}"
-    )
+    print(f"[split] cases: total={len(cases)} | train={len(train_cases)} | val={len(val_cases)} | test={len(test_cases)}")
+    print(f"[split] patches: train={len(train_idx)} | val={len(val_idx)} | test={len(test_idx)}")
 
     train_ds = Subset(ds, train_idx)
     val_ds = Subset(ds, val_idx)
@@ -403,7 +573,6 @@ def build_case_split_dataloaders(
     )
 
     return train_loader, val_loader, test_loader
-
 
 if __name__ == "__main__":
     import yaml

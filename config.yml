@@ -1,5 +1,5 @@
 trainer:
-  batch_size: 2
+  batch_size: 16
 
 checkpoint: TryFirst
 
@@ -35,6 +35,18 @@ sr:
   save_full_ckpt: true
   val_vis_keep: 5    # 验证时保存多少张可视化图片
 
+  # disc 配置
+  disc:
+    generate_before_train: true
+    sam_ckpt: ./src/models/sam_vit_b_01ec64.pth
+    sam_model_type: vit_b
+    device: cuda
+    require_done: true
+    disc_root: ""     # 留空则默认 out_img_dir/disc_maps
+    max_items: -1     # -1 全量；调试可设 200
+    overwrite: false
+    log_every: 50
+
   # vfm 配置
   vfm:
     name: dinov2
@@ -45,6 +57,11 @@ sr:
     control_mode: energy_edge_gray # 输出3通道如何组装
     normalize: true
     cache: false
+  
+    # VFM / DINOv2 co-training
+    vfm_unfreeze_last_blocks: 2
+    vfm_warmup_steps: 0
+    vfm_lr: 1e-6
 
   # validation
   val_every: 100        # 每多少 step 做一次验证
@@ -53,12 +70,12 @@ sr:
 
 TCGA_LUAD:
   root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-LUAD/
-  choose_WSI: 10
+  choose_WSI: 50
 
 TCGA_KIRC:
   root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-KIRC/
-  choose_WSI: 10
+  choose_WSI: 50
 
 TCGA_LIHC:
   root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-LIHC/
-  choose_WSI: 10
+  choose_WSI: 50

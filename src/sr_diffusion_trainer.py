@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm import tqdm
@@ -28,29 +29,73 @@ from src.vfm_control import VFMConfig, VFMControlGenerator
 
 @dataclass
 class SRTrainConfig:
-    # SD1.5：repo_id（需联网）或本地目录（推荐离线）
+    # -------------------------
+    # basic / io
+    # -------------------------
+    output_dir: str = "./outputs"
+    checkpoint: str = "TryFirst"         # 用于日志/实验名
+    device: str = "cuda"
+    seed: int = 42
+
+    # -------------------------
+    # pretrained weights
+    # -------------------------
     pretrained_sd15: str = "runwayml/stable-diffusion-v1-5"
-    val_vis_keep: int = 5
-    output_dir: str = "./outputs/sr_controlnet"
-    lr: float = 1e-5
+    token: Optional[str] = None          # HuggingFace token（可选）
+    local_dir: str = ""                  # DINOv2 本地权重目录（必填：你现在是离线加载）
+
+    # -------------------------
+    # training
+    # -------------------------
+    lr: float = 1e-4
     train_steps: int = 20000
     grad_accum: int = 1
-    mixed_precision: str = "fp16"  # "no" / "fp16" / "bf16"
-    save_every: int = 2000
-    device: str = "cuda"
-
-    # VFM control
-    local_dir: str = "./src/models/dinov2_vitb14"
-
-    # checkpoint
-    save_full_ckpt: bool = False  # True: 保存 optimizer/scaler/step；False: 仅保存 controlnet 权重
-    ckpt_root: str = "checkpoints"  # 子目录名：{output_dir}/{ckpt_root}/step_XXXXXXXX
-
-    # validation（step-based）
-    val_every: int = 0
+    mixed_precision: str = "fp16"        # "fp16" | "bf16" | "no"
+    save_every: int = 1000               # 覆盖式 latest 保存频率
+    val_every: int = 2000
     val_batches: int = 10
-    sample_steps: int = 20  # validate/sample 时 DDPM 采样步数（越大越慢）
+    sample_steps: int = 20               # 验证/采样的扩散步数（越大越慢）
+    val_vis_keep: int = 5                # 验证可视化结果保留数量（按 step，0=不保留）
 
+    # -------------------------
+    # checkpoint behavior
+    # -------------------------
+    save_full_ckpt: bool = False         # True: 额外保存 optimizer/scaler 等 trainer_state.pt
+    resume_ckpt: Optional[str] = None    # 手动指定恢复路径（可选）
+
+    # -------------------------
+    # VFM / DINOv2 co-training (NEW)
+    # -------------------------
+    vfm_unfreeze_last_blocks: int = 2    # ✅只解冻最后 N 个 transformer blocks（推荐 1~2 起步）
+    # 如果你之后要做 warmup 再解冻，可以加这个（目前我给你的实现没有强制用到，但预留很有用）
+    vfm_warmup_steps: int = 0            # 0 表示一开始就按 unfreeze_last_blocks 训练
+
+    # 如果你希望 VFM 用独立学习率（目前我给你的实现是共用 lr；你可后续扩展 optimizer 分组）
+    vfm_lr: Optional[float] = None       # None 表示跟 lr 一样；或设置为 lr*0.1 之类
+
+    # -------------------------
+    # discrepancy-guided / survival-aware (NEW - 预留)
+    # 说明：你目前决定“先用 proxy 占位”，后续接入 VLM 差异图，这些参数就能派上用场
+    # -------------------------
+    use_proxy_discrepancy: bool = True   # True: 用 proxy 生成差异图（梯度差/SSIM 等）
+    disc_alpha: float = 2.0              # 差异图权重放大系数（1 + disc_alpha * D）
+
+    # survival-aware weighting（如果你后续把 time/event 融进去）
+    surv_beta: float = 1.0               # event=1 & time短 的样本权重系数
+
+    # -------------------------
+    # bookkeeping (optional)
+    # -------------------------
+    init_best_psnr: float = -1e9         # 用于 resume 后 best tracking
+    init_best_step: int = 0
+
+    # -------------------------
+    # ✅ Color correction (inference-time, used in validate metrics)
+    # -------------------------
+    enable_color_correction: bool = True         # True: validate 时对 SR 做颜色矫正再算指标
+    color_correction_method: str = "reinhard"    # 目前仅实现 reinhard
+    color_correction_ref: str = "hr"             # "hr"(每张用对应GT) 或 "template"(用固定模板)
+    color_template_path: str = ""                # ref="template" 时填写一个 HR patch 路径
 
 def make_control_image_from_lr_fallback(lr_up: torch.Tensor) -> torch.Tensor:
     """
@@ -77,7 +122,7 @@ class DiffusionSRControlNetTrainer:
         self.metrics = SRMetrics(device=self.device)
 
         # ----------------------------
-        # ✅ M1: init DINOv2 control generator (frozen)
+        # ✅ M1: init DINOv2 control generator (trainable-last-blocks)
         # ----------------------------
         self.vfm_cfg = VFMConfig(
             variant="dinov2_vitb14",
@@ -89,7 +134,19 @@ class DiffusionSRControlNetTrainer:
         )
         self.ctrl_gen = VFMControlGenerator(self.vfm_cfg, device=self.device)
         self._warned_control_fallback = False
-        print(f"[VFM] enabled: {self.vfm_cfg.variant} | local_dir={self.vfm_cfg.local_dir}")
+
+        # 训练策略：只解冻最后若干层（默认 2）
+        self.vfm_unfreeze_last_blocks = int(getattr(cfg, "vfm_unfreeze_last_blocks", 2) or 0)
+        self.ctrl_gen.set_trainable(unfreeze_last_n_blocks=self.vfm_unfreeze_last_blocks, train_ln=True)
+
+        print(
+            f"[VFM] enabled: {self.vfm_cfg.variant} | local_dir={self.vfm_cfg.local_dir} | "
+            f"unfreeze_last_blocks={self.vfm_unfreeze_last_blocks}"
+        )
+
+        # best tracking (for best-PSNR ckpt)
+        self.best_psnr = float(getattr(cfg, "init_best_psnr", -1e9))
+        self.best_step = int(getattr(cfg, "init_best_step", 0))
 
         # ----------------------------
         # SD1.5 components
@@ -122,19 +179,110 @@ class DiffusionSRControlNetTrainer:
         self.unet.eval()
         self.text_encoder.eval()
 
-        # train controlnet only
+        # train controlnet + (optional) trainable parts of ctrl_gen
         self.controlnet.train()
-        self.optimizer = AdamW(self.controlnet.parameters(), lr=float(cfg.lr))
+        self.ctrl_gen.train()
+
+        trainable_ctrl_params = [p for p in self.ctrl_gen.parameters() if p.requires_grad]
+        opt_params = list(self.controlnet.parameters()) + trainable_ctrl_params
+        self.optimizer = AdamW(opt_params, lr=float(cfg.lr))
 
         # AMP
         self.use_amp = (cfg.mixed_precision in ("fp16", "bf16"))
         self.autocast_dtype = torch.float16 if cfg.mixed_precision == "fp16" else torch.bfloat16
-        # ✅ torch.amp.GradScaler recommended in your env warning
         self.scaler = torch.amp.GradScaler("cuda", enabled=(cfg.mixed_precision == "fp16"))
 
         # cache empty prompt
-        self.empty_prompt_embeds = self._encode_text([""])
+        self.empty_prompt_embeds = self._encode_text([""]) 
+        
+        
+        
+    def _proxy_discrepancy_map(self, a_01: torch.Tensor, b_01: torch.Tensor) -> torch.Tensor:
+        """
+        Proxy discrepancy map D in [0,1], higher = more inconsistent.
+        Here we use gradient-magnitude difference as a cheap, stable placeholder.
 
+        a_01, b_01: [B,3,H,W] in [0,1]
+        return: D [B,1,H,W] in [0,1]
+        """
+        # grayscale
+        a = a_01.mean(dim=1, keepdim=True)
+        b = b_01.mean(dim=1, keepdim=True)
+
+        # Sobel kernels
+        kx = torch.tensor([[-1, 0, 1],
+                        [-2, 0, 2],
+                        [-1, 0, 1]], dtype=a.dtype, device=a.device).view(1, 1, 3, 3)
+        ky = torch.tensor([[-1, -2, -1],
+                        [ 0,  0,  0],
+                        [ 1,  2,  1]], dtype=a.dtype, device=a.device).view(1, 1, 3, 3)
+
+        # grad magnitude
+        ax = F.conv2d(a, kx, padding=1)
+        ay = F.conv2d(a, ky, padding=1)
+        bx = F.conv2d(b, kx, padding=1)
+        by = F.conv2d(b, ky, padding=1)
+
+        ga = torch.sqrt(ax * ax + ay * ay + 1e-12)
+        gb = torch.sqrt(bx * bx + by * by + 1e-12)
+
+        d = torch.abs(ga - gb)  # [B,1,H,W]
+
+        # normalize per-sample to [0,1]
+        B = d.shape[0]
+        d_flat = d.view(B, -1)
+        d_min = d_flat.min(dim=1)[0].view(B, 1, 1, 1)
+        d_max = d_flat.max(dim=1)[0].view(B, 1, 1, 1)
+        d = (d - d_min) / (d_max - d_min + 1e-6)
+        return d.clamp(0, 1)    
+        
+    def _survival_weight(self, time: torch.Tensor, event: torch.Tensor) -> torch.Tensor:
+        """
+        Survival-aware per-sample weight.
+        - event=1 gets higher weight
+        - shorter time gets higher weight (rank-normalized)
+        return: w [B] (>=1)
+        """
+        # ensure float tensors on device
+        t = time.float().to(self.device)
+        e = event.float().to(self.device)
+
+        # avoid div by zero; also robust if time already normalized
+        inv_t = 1.0 / (t + 1e-6)
+
+        # rank-normalize inv_t to [0,1]
+        # (cheap approximation: min-max per batch)
+        inv_min = inv_t.min()
+        inv_max = inv_t.max()
+        inv_norm = (inv_t - inv_min) / (inv_max - inv_min + 1e-6)
+
+        w = 1.0 + float(getattr(self, "surv_beta", 1.0)) * e * inv_norm
+        return w.detach()    
+    
+    def _cox_ph_loss(self, risk: torch.Tensor, time: torch.Tensor, event: torch.Tensor) -> torch.Tensor:
+        """
+        Standard Cox partial likelihood (negative log-likelihood).
+        risk: [B] (higher = higher hazard)
+        time: [B]
+        event: [B] (1=observed, 0=censored)
+        """
+        r = risk.view(-1).float()
+        t = time.view(-1).float()
+        e = event.view(-1).float()
+
+        # sort by time descending so that risk set is prefix
+        order = torch.argsort(t, descending=True)
+        r = r[order]
+        e = e[order]
+
+        # log cumulative sum exp for risk set
+        log_cumsum = torch.logcumsumexp(r, dim=0)
+
+        # only for observed events
+        neg_log_lik = -(r - log_cumsum) * e
+        denom = e.sum().clamp(min=1.0)
+        return neg_log_lik.sum() / denom
+        
     # ----------------------------
     # helpers
     # ----------------------------
@@ -175,6 +323,96 @@ class DiffusionSRControlNetTrainer:
                 self._warned_control_fallback = True
             return make_control_image_from_lr_fallback(lr_up_512)
 
+    def _build_control_train(self, lr_up_512: torch.Tensor) -> torch.Tensor:
+        """
+        训练用 control：允许梯度（用于同步优化 DINOv2 最后若干层）
+        """
+        try:
+            return self.ctrl_gen.forward_train(lr_up_512)
+        except Exception as e:
+            if not self._warned_control_fallback:
+                print(f"[WARN] VFM control failed once, fallback to lr-edge control. err={e}")
+                self._warned_control_fallback = True
+            return make_control_image_from_lr_fallback(lr_up_512)
+
+    @torch.no_grad()
+    def _build_control_eval(self, lr_up_512: torch.Tensor) -> torch.Tensor:
+        """
+        验证/采样用 control：no_grad，保证速度与确定性
+        """
+        try:
+            return self.ctrl_gen(lr_up_512)
+        except Exception as e:
+            if not self._warned_control_fallback:
+                print(f"[WARN] VFM control failed once, fallback to lr-edge control. err={e}")
+                self._warned_control_fallback = True
+            return make_control_image_from_lr_fallback(lr_up_512)
+    
+    
+    def _reinhard_color_match_u8(self, src_rgb_u8: np.ndarray, ref_rgb_u8: np.ndarray) -> np.ndarray:
+        """
+        Reinhard color transfer in LAB space (8-bit, PIL backend).
+        src_rgb_u8/ref_rgb_u8: [H,W,3] uint8 RGB
+        return: corrected RGB uint8 [H,W,3]
+        """
+        # PIL expects uint8
+        src_lab = Image.fromarray(src_rgb_u8, mode="RGB").convert("LAB")
+        ref_lab = Image.fromarray(ref_rgb_u8, mode="RGB").convert("LAB")
+
+        src = np.array(src_lab).astype(np.float32)  # [H,W,3]
+        ref = np.array(ref_lab).astype(np.float32)
+
+        # per-channel mean/std
+        src_mu = src.reshape(-1, 3).mean(axis=0)
+        src_std = src.reshape(-1, 3).std(axis=0) + 1e-6
+        ref_mu = ref.reshape(-1, 3).mean(axis=0)
+        ref_std = ref.reshape(-1, 3).std(axis=0) + 1e-6
+
+        out = (src - src_mu) / src_std
+        out = out * ref_std + ref_mu
+        out = np.clip(out, 0, 255).astype(np.uint8)
+
+        out_rgb = Image.fromarray(out, mode="LAB").convert("RGB")
+        return np.array(out_rgb)
+
+
+    def _apply_color_correction_batch(self, sr_01: torch.Tensor, hr_01: torch.Tensor) -> torch.Tensor:
+        """
+        Apply color correction to SR, return SR_cc in [0,1].
+        sr_01/hr_01: [B,3,512,512] float in [0,1]
+        """
+        if not bool(getattr(self.cfg, "enable_color_correction", True)):
+            return sr_01
+
+        method = str(getattr(self.cfg, "color_correction_method", "reinhard")).lower()
+        ref_mode = str(getattr(self.cfg, "color_correction_ref", "hr")).lower()
+
+        if method != "reinhard":
+            # fallback: no correction
+            return sr_01
+
+        # prepare template reference (optional)
+        template_rgb_u8 = None
+        if ref_mode == "template":
+            p = str(getattr(self.cfg, "color_template_path", "") or "")
+            if p and os.path.isfile(p):
+                template_rgb_u8 = np.array(Image.open(p).convert("RGB"), dtype=np.uint8)
+
+        # CPU loop (validation only, OK)
+        sr_cc = []
+        sr_u8 = (sr_01.detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+        hr_u8 = (hr_01.detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+
+        for i in range(sr_u8.shape[0]):
+            src = sr_u8[i]
+            ref = template_rgb_u8 if (template_rgb_u8 is not None) else hr_u8[i]
+            out = self._reinhard_color_match_u8(src, ref)  # uint8 RGB
+            out_t = torch.from_numpy(out).permute(2, 0, 1).float() / 255.0
+            sr_cc.append(out_t)
+
+        sr_cc = torch.stack(sr_cc, dim=0).to(device=sr_01.device, dtype=sr_01.dtype)
+        return sr_cc.clamp(0, 1)
+    
     # ----------------------------
     # checkpoint utils
     # ----------------------------
@@ -260,48 +498,66 @@ class DiffusionSRControlNetTrainer:
             except Exception as e:
                 print(f"[WARN] failed to prune val_vis dir={d}: {e}")
     
-    def save_checkpoint(self, step: int, ckpt_name: str = "latest", extra_meta: Optional[Dict] = None):
+    def save_checkpoint(self, step: int, is_best: bool = False):
         """
-        ckpt_name:
-        - "latest": ✅ always overwrite, keep only the newest checkpoint
-        - "best"  : ✅ overwrite when best PSNR improves
-        - legacy/other: still supported, will write to {ckpt_root}/{ckpt_name}
+        - latest：始终覆盖式写入 {ckpt_root}/latest
+        - best：当 is_best=True 时，覆盖式写入 {ckpt_root}/best
+        同时保存：
+        - controlnet（diffusers save_pretrained）
+        - vfm_control（torch.save state_dict，用于恢复已解冻的 DINOv2 层）
+        - （可选）trainer_state.pt：当 cfg.save_full_ckpt=True
+        - meta.json：记录 step / best_psnr / best_step / unfreeze_last_blocks
         """
         ckpt_root = self._ckpt_root_dir()
         os.makedirs(ckpt_root, exist_ok=True)
 
-        ckpt_dir = os.path.join(ckpt_root, str(ckpt_name))
+        tag = "best" if is_best else "latest"
+        ckpt_dir = os.path.join(ckpt_root, tag)
+
+        # 覆盖旧目录
+        if os.path.isdir(ckpt_dir):
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
         os.makedirs(ckpt_dir, exist_ok=True)
 
         # 1) controlnet
         self.controlnet.save_pretrained(os.path.join(ckpt_dir, "controlnet"))
 
-        # 2) full state (optional)
+        # 2) vfm control generator (包含 DINOv2 及其已解冻层的权重状态)
+        torch.save(self.ctrl_gen.state_dict(), os.path.join(ckpt_dir, "vfm_control.pt"))
+
+        # 3) full state
         if getattr(self.cfg, "save_full_ckpt", False):
             payload = {
                 "global_step": int(step),
                 "optimizer": self.optimizer.state_dict(),
                 "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+                "best_psnr": float(self.best_psnr),
+                "best_step": int(self.best_step),
             }
             torch.save(payload, os.path.join(ckpt_dir, "trainer_state.pt"))
 
-        # 3) meta
-        meta = {"global_step": int(step), "ckpt_name": str(ckpt_name)}
-        if isinstance(extra_meta, dict):
-            meta.update(extra_meta)
-
+        # 4) meta
         with open(os.path.join(ckpt_dir, "meta.json"), "w") as f:
-            json.dump(meta, f, indent=2)
+            json.dump(
+                {
+                    "global_step": int(step),
+                    "best_psnr": float(self.best_psnr),
+                    "best_step": int(self.best_step),
+                    "vfm_unfreeze_last_blocks": int(getattr(self, "vfm_unfreeze_last_blocks", 0)),
+                    "tag": tag,
+                },
+                f,
+                indent=2,
+            )
 
-        print(f"[ckpt] saved ({ckpt_name}) checkpoint to {ckpt_dir}")
+        print(f"[ckpt] saved {tag} checkpoint to {ckpt_dir}")
 
     def load_checkpoint(self, ckpt_dir: str, strict_full: bool = True) -> int:
         """
-        ckpt_dir: .../step_XXXXXXXX
-        strict_full:
-          - True: 如果 cfg.save_full_ckpt=True，则要求 trainer_state.pt 存在
-          - False: 只要 controlnet 存在就能加载（用于“加载权重继续训但不恢复优化器”）
-        return: global_step
+        支持加载：
+        - {ckpt_dir}/controlnet
+        - {ckpt_dir}/vfm_control.pt（若存在）
+        - {ckpt_dir}/trainer_state.pt（若存在且 cfg.save_full_ckpt=True）
         """
         if not ckpt_dir or (not os.path.isdir(ckpt_dir)):
             raise FileNotFoundError(f"ckpt_dir not found: {ckpt_dir}")
@@ -314,18 +570,42 @@ class DiffusionSRControlNetTrainer:
         self.controlnet = ControlNetModel.from_pretrained(controlnet_dir).to(self.device)
         self.controlnet.train()
 
-        # 2) IMPORTANT: rebuild optimizer to bind NEW controlnet params
-        self.optimizer = AdamW(self.controlnet.parameters(), lr=float(self.cfg.lr))
+        # 2) restore vfm control (optional)
+        vfm_path = os.path.join(ckpt_dir, "vfm_control.pt")
+        if os.path.isfile(vfm_path):
+            sd = torch.load(vfm_path, map_location="cpu")
+            missing, unexpected = self.ctrl_gen.load_state_dict(sd, strict=False)
+            if missing or unexpected:
+                print(f"[ckpt] vfm_control loaded with strict=False | missing={len(missing)} unexpected={len(unexpected)}")
+        else:
+            print("[ckpt] vfm_control.pt not found, will use freshly loaded DINOv2 weights from local_dir.")
 
-        # default step from folder name
-        m = re.search(r"step_(\d+)", os.path.basename(ckpt_dir))
-        global_step = int(m.group(1)) if m else 0
+        # 3) IMPORTANT: rebuild optimizer to bind NEW params (controlnet + trainable ctrl_gen parts)
+        trainable_ctrl_params = [p for p in self.ctrl_gen.parameters() if p.requires_grad]
+        opt_params = list(self.controlnet.parameters()) + trainable_ctrl_params
+        self.optimizer = AdamW(opt_params, lr=float(self.cfg.lr))
 
-        # 3) load full state if available/wanted
+        # default step from folder name or meta
+        global_step = 0
+        meta_path = os.path.join(ckpt_dir, "meta.json")
+        if os.path.isfile(meta_path):
+            try:
+                meta = json.load(open(meta_path, "r"))
+                global_step = int(meta.get("global_step", 0))
+                self.best_psnr = float(meta.get("best_psnr", self.best_psnr))
+                self.best_step = int(meta.get("best_step", self.best_step))
+            except Exception:
+                pass
+
+        # 4) load full state if available/wanted
         state_path = os.path.join(ckpt_dir, "trainer_state.pt")
         if os.path.exists(state_path):
             payload = torch.load(state_path, map_location="cpu")
             global_step = int(payload.get("global_step", global_step))
+
+            # best tracking
+            self.best_psnr = float(payload.get("best_psnr", self.best_psnr))
+            self.best_step = int(payload.get("best_step", self.best_step))
 
             if payload.get("optimizer", None) is not None:
                 self.optimizer.load_state_dict(payload["optimizer"])
@@ -340,9 +620,13 @@ class DiffusionSRControlNetTrainer:
                 raise FileNotFoundError(f"trainer_state.pt missing: {state_path}")
             print("[ckpt] trainer_state.pt not found, loaded weights only (optimizer/scaler reset).")
 
-        print(f"[ckpt] loaded from {ckpt_dir}, resume global_step={global_step}")
+        print(
+            f"[ckpt] loaded from {ckpt_dir}, resume global_step={global_step} | "
+            f"best_psnr={self.best_psnr:.6f} @ step {self.best_step}"
+        )
         return global_step
 
+   
     # ----------------------------
     # training
     # ----------------------------
@@ -355,10 +639,12 @@ class DiffusionSRControlNetTrainer:
         global_step = 0
         ckpt_used = None
 
-        if resume_ckpt:  # user specified
+        if resume_ckpt:
             ckpt_used = resume_ckpt
         else:
-            ckpt_used = self._find_latest_checkpoint()
+            ckpt_root = self._ckpt_root_dir()
+            latest_dir = os.path.join(ckpt_root, "latest")
+            ckpt_used = latest_dir if os.path.isdir(latest_dir) else self._find_latest_checkpoint()
 
         if ckpt_used:
             try:
@@ -373,26 +659,6 @@ class DiffusionSRControlNetTrainer:
         if global_step >= int(cfg.train_steps):
             print(f"[WARN] global_step({global_step}) >= train_steps({cfg.train_steps}). Nothing to train.")
             return
-
-        # -------------------------
-        # best PSNR state (persisted)
-        # -------------------------
-        ckpt_root = self._ckpt_root_dir()
-        best_state_path = os.path.join(ckpt_root, "best_score.json")
-        best_psnr = float("-inf")
-        best_step = -1
-        if os.path.isfile(best_state_path):
-            try:
-                with open(best_state_path, "r") as f:
-                    d = json.load(f)
-                best_psnr = float(d.get("best_psnr", best_psnr))
-                best_step = int(d.get("best_step", best_step))
-                print(f"[best] loaded best_psnr={best_psnr:.6f} @ step={best_step}")
-            except Exception as e:
-                print(f"[WARN] failed to read best_score.json, reset best. err={e}")
-
-        self.best_psnr = best_psnr
-        self.best_step = best_step
 
         # -------------------------
         # validation schedule
@@ -412,6 +678,7 @@ class DiffusionSRControlNetTrainer:
         )
 
         data_iter = iter(train_loader)
+        last_postfix = {}
 
         # -------------------------
         # main loop
@@ -426,9 +693,9 @@ class DiffusionSRControlNetTrainer:
             lr = batch["lr"].to(self.device, non_blocking=True)  # [B,3,128,128]
             hr = batch["hr"].to(self.device, non_blocking=True)  # [B,3,512,512]
 
-            # control
+            # control (TRAIN: allow gradients into DINOv2 last blocks)
             lr_up = F.interpolate(lr, size=(512, 512), mode="bicubic", align_corners=False)
-            control_image = self._build_control(lr_up)  # [B,3,512,512]
+            control_image = self._build_control_train(lr_up)
 
             # target latents
             with torch.no_grad():
@@ -487,25 +754,43 @@ class DiffusionSRControlNetTrainer:
             # step update
             global_step += 1
             pbar.update(1)
-            pbar.set_postfix({"loss": float(loss.detach().cpu())})
 
-            # validation (also handles best checkpoint inside validate)
+            # ✅ always update postfix from dict we own
+            last_postfix = {"loss": float(loss.detach().cpu())}
+            pbar.set_postfix(last_postfix)
+
+            # validation + best ckpt
             if do_val and (global_step % val_every == 0):
                 try:
                     metrics = self.validate(val_loader, step=global_step, max_batches=val_batches)
+
                     if isinstance(metrics, dict) and metrics:
                         show = {f"val_{k}": float(v) for k, v in metrics.items()}
-                        pbar.set_postfix({**pbar.postfix, **show})
+                        merged = dict(last_postfix)
+                        merged.update(show)
+                        pbar.set_postfix(merged)
+
+                        # best by PSNR
+                        cur_psnr = float(metrics.get("PSNR", 0.0))
+                        if cur_psnr > float(self.best_psnr):
+                            self.best_psnr = cur_psnr
+                            self.best_step = int(global_step)
+                            print(
+                                f"[best] PSNR improved to {self.best_psnr:.6f} "
+                                f"@ step {self.best_step}, saving best..."
+                            )
+                            self.save_checkpoint(global_step, is_best=True)
+
                 except Exception as e:
                     print(f"[WARN] validate failed at step={global_step}: {e}")
 
-            # ✅ checkpoint: keep only latest (overwrite)
+            # latest checkpoint (overwrite)
             if (global_step % int(cfg.save_every) == 0):
-                self.save_checkpoint(global_step, ckpt_name="latest")
+                self.save_checkpoint(global_step, is_best=False)
 
         pbar.close()
-        # ✅ final save: overwrite latest
-        self.save_checkpoint(global_step, ckpt_name="latest")
+        self.save_checkpoint(global_step, is_best=False)
+
 
     # ----------------------------
     # sampling
@@ -513,10 +798,13 @@ class DiffusionSRControlNetTrainer:
     @torch.no_grad()
     def sample_sr(self, lr: torch.Tensor, num_steps: Optional[int] = None) -> torch.Tensor:
         self.controlnet.eval()
+        self.ctrl_gen.eval()
 
         num_steps = int(num_steps or getattr(self.cfg, "sample_steps", 20))
         lr_up = F.interpolate(lr, size=(512, 512), mode="bicubic", align_corners=False)
-        control = self._build_control(lr_up)
+
+        # ✅ use eval control path
+        control = self._build_control_eval(lr_up)
 
         B = lr.shape[0]
         latents = torch.randn((B, 4, 64, 64), device=self.device)
@@ -525,7 +813,6 @@ class DiffusionSRControlNetTrainer:
 
         for t in self.noise_scheduler.timesteps:
             encoder_hidden_states = self.empty_prompt_embeds.repeat(B, 1, 1)
-
             down, mid = self.controlnet(
                 latents,
                 t,
@@ -533,7 +820,6 @@ class DiffusionSRControlNetTrainer:
                 controlnet_cond=control,
                 return_dict=False,
             )
-
             noise_pred = self.unet(
                 latents,
                 t,
@@ -542,12 +828,15 @@ class DiffusionSRControlNetTrainer:
                 mid_block_additional_residual=mid,
                 return_dict=False,
             )[0]
-
             latents = self.noise_scheduler.step(noise_pred, t, latents).prev_sample
 
         sr = self._vae_decode(latents)
+
+        # back to train
         self.controlnet.train()
+        self.ctrl_gen.train()
         return sr
+
 
     # ----------------------------
     # validation + save SR/GT/control
@@ -555,8 +844,15 @@ class DiffusionSRControlNetTrainer:
     @torch.no_grad()
     def validate(self, val_loader, step: int = 0, max_batches: int = 10) -> Dict[str, float]:
         self.controlnet.eval()
+        self.ctrl_gen.eval()
 
-        psnr_list, ssim_list, lpips_list, stlpips_list = [], [], [], []
+        # raw metrics (before color correction)
+        psnr_raw_list, ssim_raw_list = [], []
+        lpips_raw_list, stlpips_raw_list = [], []
+
+        # corrected metrics (after color correction)
+        psnr_list, ssim_list = [], []
+        lpips_list, stlpips_list = [], []
 
         # save one random example
         save_vis = True
@@ -581,7 +877,7 @@ class DiffusionSRControlNetTrainer:
             hr = batch["hr"].to(self.device, non_blocking=True)
 
             lr_up = F.interpolate(lr, size=(512, 512), mode="bicubic", align_corners=False)
-            control = self._build_control(lr_up)
+            control = self._build_control_eval(lr_up)
 
             # inline sampling (avoid state flips)
             B = lr.shape[0]
@@ -608,19 +904,28 @@ class DiffusionSRControlNetTrainer:
                 )[0]
                 latents = self.noise_scheduler.step(noise_pred, t, latents).prev_sample
 
-            sr = self._vae_decode(latents)
+            sr = self._vae_decode(latents)  # [B,3,512,512] in [0,1]
 
-            # metrics
-            psnr_list.append(float(self.metrics.psnr(sr, hr)))
-            ssim_list.append(float(self.metrics.ssim(sr, hr)))
-            lpips_list.append(float(self.metrics.lpips(sr, hr)))
-            stlpips_list.append(float(self.metrics.shift_tolerant_lpips(sr, hr)))
+            # ✅ color correction (validation-time postprocess)
+            sr_cc = self._apply_color_correction_batch(sr, hr)
+
+            # ---- metrics: raw & corrected ----
+            psnr_raw_list.append(float(self.metrics.psnr(sr, hr)))
+            ssim_raw_list.append(float(self.metrics.ssim(sr, hr)))
+            lpips_raw_list.append(float(self.metrics.lpips(sr, hr)))
+            stlpips_raw_list.append(float(self.metrics.shift_tolerant_lpips(sr, hr)))
+
+            psnr_list.append(float(self.metrics.psnr(sr_cc, hr)))
+            ssim_list.append(float(self.metrics.ssim(sr_cc, hr)))
+            lpips_list.append(float(self.metrics.lpips(sr_cc, hr)))
+            stlpips_list.append(float(self.metrics.shift_tolerant_lpips(sr_cc, hr)))
 
             # save one example
             if save_vis and (not vis_saved) and (i == vis_batch_idx):
                 j = int(np.random.randint(0, B))
 
-                Image.fromarray(to_u8(sr[j])).save(os.path.join(vis_root, "SR.png"))
+                Image.fromarray(to_u8(sr[j])).save(os.path.join(vis_root, "SR_raw.png"))
+                Image.fromarray(to_u8(sr_cc[j])).save(os.path.join(vis_root, "SR_cc.png"))
                 Image.fromarray(to_u8(hr[j])).save(os.path.join(vis_root, "GT.png"))
                 Image.fromarray(to_u8(lr_up[j])).save(os.path.join(vis_root, "LR_up.png"))
                 Image.fromarray(to_u8(control[j])).save(os.path.join(vis_root, "CONTROL.png"))
@@ -630,54 +935,42 @@ class DiffusionSRControlNetTrainer:
                     f.write(f"batch_idx: {i}\n")
                     f.write(f"sample_idx: {j}\n")
                     f.write(f"sample_steps: {num_steps}\n")
+                    f.write("\n# RAW (before color correction)\n")
+                    f.write(f"PSNR_raw: {psnr_raw_list[-1]:.6f}\n")
+                    f.write(f"SSIM_raw: {ssim_raw_list[-1]:.6f}\n")
+                    f.write(f"LPIPS_raw: {lpips_raw_list[-1]:.6f}\n")
+                    f.write(f"ST-LPIPS_raw: {stlpips_raw_list[-1]:.6f}\n")
+                    f.write("\n# CC (after color correction)\n")
                     f.write(f"PSNR: {psnr_list[-1]:.6f}\n")
                     f.write(f"SSIM: {ssim_list[-1]:.6f}\n")
                     f.write(f"LPIPS: {lpips_list[-1]:.6f}\n")
                     f.write(f"ST-LPIPS: {stlpips_list[-1]:.6f}\n")
 
                 vis_saved = True
-                print(f"[val] saved SR/GT/LR_up/CONTROL to: {vis_root}")
+                print(f"[val] saved SR_raw/SR_cc/GT/LR_up/CONTROL to: {vis_root}")
                 self._prune_val_vis()
 
+        # back to train mode
         self.controlnet.train()
+        self.ctrl_gen.train()
 
         results = {
+            # ✅ main metrics use corrected SR (this will drive best-PSNR checkpoint)
             "PSNR": float(np.mean(psnr_list)) if psnr_list else 0.0,
             "SSIM": float(np.mean(ssim_list)) if ssim_list else 0.0,
             "LPIPS": float(np.mean(lpips_list)) if lpips_list else 0.0,
             "ST-LPIPS": float(np.mean(stlpips_list)) if stlpips_list else 0.0,
+
+            # extra: raw metrics for ablation/logging
+            "PSNR_raw": float(np.mean(psnr_raw_list)) if psnr_raw_list else 0.0,
+            "SSIM_raw": float(np.mean(ssim_raw_list)) if ssim_raw_list else 0.0,
+            "LPIPS_raw": float(np.mean(lpips_raw_list)) if lpips_raw_list else 0.0,
+            "ST-LPIPS_raw": float(np.mean(stlpips_raw_list)) if stlpips_raw_list else 0.0,
         }
 
         print(
             f"[val @ step {step}] "
-            f"PSNR={results['PSNR']:.3f} | "
-            f"SSIM={results['SSIM']:.4f} | "
-            f"LPIPS={results['LPIPS']:.4f} | "
-            f"ST-LPIPS={results['ST-LPIPS']:.4f}"
+            f"PSNR(raw)={results['PSNR_raw']:.3f} -> PSNR(cc)={results['PSNR']:.3f} | "
+            f"SSIM(raw)={results['SSIM_raw']:.4f} -> SSIM(cc)={results['SSIM']:.4f}"
         )
-
-        # ✅ Always overwrite "latest" checkpoint (keep only newest)
-        try:
-            self.save_checkpoint(step, ckpt_name="latest", extra_meta={"val_metrics": results})
-        except Exception as e:
-            print(f"[WARN] failed to save latest ckpt at val step={step}: {e}")
-
-        # ✅ Save best by PSNR (overwrite "best" only when improved)
-        try:
-            cur_psnr = float(results.get("PSNR", 0.0))
-            best_psnr = float(getattr(self, "best_psnr", float("-inf")))
-            if cur_psnr > best_psnr:
-                self.best_psnr = cur_psnr
-                self.best_step = int(step)
-
-                self.save_checkpoint(step, ckpt_name="best", extra_meta={"best_psnr": cur_psnr, "best_step": int(step)})
-
-                best_state_path = os.path.join(self._ckpt_root_dir(), "best_score.json")
-                with open(best_state_path, "w") as f:
-                    json.dump({"best_psnr": float(cur_psnr), "best_step": int(step)}, f, indent=2)
-
-                print(f"[best] updated best checkpoint: PSNR={cur_psnr:.6f} @ step={step}")
-        except Exception as e:
-            print(f"[WARN] best checkpoint update failed at step={step}: {e}")
-
         return results

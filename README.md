@@ -20,6 +20,14 @@ pip install -r ./requirements/requirements.txt
 
 ```
 
+SAM
+user need to download weight vit_b ```sam vit b 01ec64.pth``` from this link: 
+```
+https://github.com/facebookresearch/segment-anything?tab=readme-ov-file
+```
+and then set it into `src/models/`
+
+
 And use Huggingface, user need to make self-token like:
 ```
 hf_xxxxxxxxxxxxxxxxxxx

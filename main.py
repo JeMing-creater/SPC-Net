@@ -43,6 +43,7 @@ from src.tcga_clinical import TCGAClinicalTable, slide_id_from_path, slide_to_ca
 from src.loader import build_case_split_dataloaders
 from src.utils import  Logger, same_seeds
 from src.sr_diffusion_trainer import SRTrainConfig, DiffusionSRControlNetTrainer
+from src.gen_sam_disc_maps import generate_sam_disc_maps
 
 
 if __name__ == "__main__":
@@ -89,6 +90,21 @@ if __name__ == "__main__":
         limit_samples = config.data_loader.patch_num
     )
     
+    disc_cfg = getattr(config.sr, "disc", None)
+    if disc_cfg and bool(getattr(disc_cfg, "generate_before_train", False)):
+        generate_sam_disc_maps(
+            out_img_dir=config.data_loader.out_img_dir,
+            sam_ckpt=str(getattr(disc_cfg, "sam_ckpt")),
+            sam_model_type=str(getattr(disc_cfg, "sam_model_type", "vit_b")),
+            device=str(getattr(disc_cfg, "device", getattr(config.sr, "device", "cuda"))),
+            patch_num=int(getattr(config.data_loader, "patch_num", 200)),
+            require_done=bool(getattr(disc_cfg, "require_done", True)),
+            disc_root=str(getattr(disc_cfg, "disc_root", "")) or None,
+            max_items=int(getattr(disc_cfg, "max_items", -1)),
+            overwrite=bool(getattr(disc_cfg, "overwrite", False)),
+            log_every=int(getattr(disc_cfg, "log_every", 50)),
+        )
+    
     
     # 构建dataloaders
     train_loader, val_loader, test_loader = build_case_split_dataloaders(
@@ -119,6 +135,10 @@ if __name__ == "__main__":
         local_dir=getattr(config.sr.vfm, "local_dir", "./src/models/dinov2_vitb14"),
         save_full_ckpt=getattr(config.sr, "save_full_ckpt", False),
         val_vis_keep=getattr(config.sr, "val_vis_keep", 5),
+        vfm_unfreeze_last_blocks=int(getattr(config.sr.vfm, "vfm_unfreeze_last_blocks", 2)),
+        vfm_warmup_steps=int(getattr(config.sr.vfm, "vfm_warmup_steps", 0)),
+        vfm_lr=float(getattr(config.sr.vfm, "vfm_lr", 1e-6)),
     )
+    
     trainer = DiffusionSRControlNetTrainer(tcfg, token=getattr(config.sr, "token", None))
     trainer.train(train_loader, val_loader=val_loader, resume_ckpt=(config.sr.resume_ckpt if config.sr.resume_ckpt != "" else None))
