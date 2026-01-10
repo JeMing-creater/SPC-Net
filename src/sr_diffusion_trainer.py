@@ -92,10 +92,11 @@ class SRTrainConfig:
     # -------------------------
     # ✅ Color correction (inference-time, used in validate metrics)
     # -------------------------
-    enable_color_correction: bool = True         # True: validate 时对 SR 做颜色矫正再算指标
-    color_correction_method: str = "reinhard"    # 目前仅实现 reinhard
-    color_correction_ref: str = "hr"             # "hr"(每张用对应GT) 或 "template"(用固定模板)
-    color_template_path: str = ""                # ref="template" 时填写一个 HR patch 路径
+    enable_color_correction: bool = True
+    color_correction_method: str = "reinhard"   # currently: reinhard
+    color_correction_ref: str = "lr"            # ✅ "lr" (recommended), or "template"
+    color_template_path: str = ""               # used when ref="template"
+    color_ref_blur_ksize: int = 31              # ✅ blur LR_up reference to stabilize stain (odd >=1)
 
 def make_control_image_from_lr_fallback(lr_up: torch.Tensor) -> torch.Tensor:
     """
@@ -376,41 +377,57 @@ class DiffusionSRControlNetTrainer:
         return np.array(out_rgb)
 
 
-    def _apply_color_correction_batch(self, sr_01: torch.Tensor, hr_01: torch.Tensor) -> torch.Tensor:
+    def _apply_color_correction_batch(self, sr_01: torch.Tensor, lr_up_01: torch.Tensor) -> torch.Tensor:
         """
-        Apply color correction to SR, return SR_cc in [0,1].
-        sr_01/hr_01: [B,3,512,512] float in [0,1]
+        Apply color correction to SR using only LR (or template).
+        sr_01:    [B,3,H,W] in [0,1]
+        lr_up_01: [B,3,H,W] in [0,1]  (bicubic upsampled LR to match SR size)
+        return: sr_cc [B,3,H,W] in [0,1]
         """
         if not bool(getattr(self.cfg, "enable_color_correction", True)):
             return sr_01
 
         method = str(getattr(self.cfg, "color_correction_method", "reinhard")).lower()
-        ref_mode = str(getattr(self.cfg, "color_correction_ref", "hr")).lower()
+        ref_mode = str(getattr(self.cfg, "color_correction_ref", "lr")).lower()
 
         if method != "reinhard":
-            # fallback: no correction
             return sr_01
 
-        # prepare template reference (optional)
+        # optional template reference (deployment-friendly)
         template_rgb_u8 = None
         if ref_mode == "template":
             p = str(getattr(self.cfg, "color_template_path", "") or "")
             if p and os.path.isfile(p):
                 template_rgb_u8 = np.array(Image.open(p).convert("RGB"), dtype=np.uint8)
 
-        # CPU loop (validation only, OK)
-        sr_cc = []
-        sr_u8 = (sr_01.detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
-        hr_u8 = (hr_01.detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+        # optional blur on LR_up reference to stabilize color statistics
+        k = int(getattr(self.cfg, "color_ref_blur_ksize", 31) or 0)
+        if k < 1:
+            k = 1
+        if k % 2 == 0:
+            k += 1  # ensure odd
 
+        # convert to uint8 RGB on CPU
+        sr_u8 = (sr_01.detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+        lr_u8 = (lr_up_01.detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+
+        sr_cc_list = []
         for i in range(sr_u8.shape[0]):
             src = sr_u8[i]
-            ref = template_rgb_u8 if (template_rgb_u8 is not None) else hr_u8[i]
+
+            if template_rgb_u8 is not None:
+                ref = template_rgb_u8
+            else:
+                # ref from LR_up (only LR available)
+                ref = lr_u8[i]
+                if k > 1:
+                    ref = np.array(Image.fromarray(ref).filter(ImageFilter.GaussianBlur(radius=k // 6)), dtype=np.uint8)
+
             out = self._reinhard_color_match_u8(src, ref)  # uint8 RGB
             out_t = torch.from_numpy(out).permute(2, 0, 1).float() / 255.0
-            sr_cc.append(out_t)
+            sr_cc_list.append(out_t)
 
-        sr_cc = torch.stack(sr_cc, dim=0).to(device=sr_01.device, dtype=sr_01.dtype)
+        sr_cc = torch.stack(sr_cc_list, dim=0).to(device=sr_01.device, dtype=sr_01.dtype)
         return sr_cc.clamp(0, 1)
     
     # ----------------------------
@@ -843,50 +860,57 @@ class DiffusionSRControlNetTrainer:
     # ----------------------------
     @torch.no_grad()
     def validate(self, val_loader, step: int = 0, max_batches: int = 10) -> Dict[str, float]:
+        """
+        Validation protocol:
+        - Generate SR from LR
+        - Apply color correction to SR using ONLY LR_up as reference (no HR used in correction)
+        - Compute metrics against HR GT (evaluation only)
+        - Save a small set of visuals (raw SR, corrected SR, GT, LR_up, CONTROL)
+        """
         self.controlnet.eval()
         self.ctrl_gen.eval()
+        self.unet.eval()
 
         # raw metrics (before color correction)
         psnr_raw_list, ssim_raw_list = [], []
         lpips_raw_list, stlpips_raw_list = [], []
-
         # corrected metrics (after color correction)
         psnr_list, ssim_list = [], []
         lpips_list, stlpips_list = [], []
 
-        # save one random example
+        num_steps = int(getattr(self.cfg, "sample_steps", 20))
+
+        # save one random example per validate() call
         save_vis = True
-        vis_batch_idx = np.random.randint(0, max(1, int(max_batches)))
         vis_saved = False
+        vis_batch_idx = int(np.random.randint(0, max(1, int(max_batches))))
 
         vis_root = os.path.join(self.cfg.output_dir, "val_vis", f"step_{step:07d}")
         os.makedirs(vis_root, exist_ok=True)
 
         def to_u8(img_3chw: torch.Tensor) -> np.ndarray:
             x = img_3chw.detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy()
-            x = (x * 255.0 + 0.5).astype(np.uint8)
-            return x
-
-        num_steps = int(getattr(self.cfg, "sample_steps", 20))
+            return (x * 255.0 + 0.5).astype(np.uint8)
 
         for i, batch in enumerate(val_loader):
             if i >= int(max_batches):
                 break
 
-            lr = batch["lr"].to(self.device, non_blocking=True)
-            hr = batch["hr"].to(self.device, non_blocking=True)
+            lr = batch["lr"].to(self.device, non_blocking=True)  # [B,3,128,128]
+            hr = batch["hr"].to(self.device, non_blocking=True)  # [B,3,512,512]
 
-            lr_up = F.interpolate(lr, size=(512, 512), mode="bicubic", align_corners=False)
-            control = self._build_control_eval(lr_up)
+            # build control from LR_up
+            lr_up = F.interpolate(lr, size=(512, 512), mode="bicubic", align_corners=False)  # [B,3,512,512]
+            control = self._build_control_eval(lr_up)  # [B,3,512,512] (or your control channels)
 
-            # inline sampling (avoid state flips)
+            # diffusion sampling
             B = lr.shape[0]
             latents = torch.randn((B, 4, 64, 64), device=self.device)
-
             self.noise_scheduler.set_timesteps(num_steps, device=self.device)
 
+            encoder_hidden_states = self.empty_prompt_embeds.repeat(B, 1, 1)
+
             for t in self.noise_scheduler.timesteps:
-                encoder_hidden_states = self.empty_prompt_embeds.repeat(B, 1, 1)
                 down, mid = self.controlnet(
                     latents,
                     t,
@@ -906,10 +930,10 @@ class DiffusionSRControlNetTrainer:
 
             sr = self._vae_decode(latents)  # [B,3,512,512] in [0,1]
 
-            # ✅ color correction (validation-time postprocess)
-            sr_cc = self._apply_color_correction_batch(sr, hr)
+            # ✅ color correction using ONLY LR (LR_up as reference), no HR involved in correction
+            sr_cc = self._apply_color_correction_batch(sr, lr_up)
 
-            # ---- metrics: raw & corrected ----
+            # ---- metrics: raw & corrected (computed against HR GT for evaluation) ----
             psnr_raw_list.append(float(self.metrics.psnr(sr, hr)))
             ssim_raw_list.append(float(self.metrics.ssim(sr, hr)))
             lpips_raw_list.append(float(self.metrics.lpips(sr, hr)))
@@ -920,7 +944,7 @@ class DiffusionSRControlNetTrainer:
             lpips_list.append(float(self.metrics.lpips(sr_cc, hr)))
             stlpips_list.append(float(self.metrics.shift_tolerant_lpips(sr_cc, hr)))
 
-            # save one example
+            # ---- save one example ----
             if save_vis and (not vis_saved) and (i == vis_batch_idx):
                 j = int(np.random.randint(0, B))
 
@@ -928,40 +952,55 @@ class DiffusionSRControlNetTrainer:
                 Image.fromarray(to_u8(sr_cc[j])).save(os.path.join(vis_root, "SR_cc.png"))
                 Image.fromarray(to_u8(hr[j])).save(os.path.join(vis_root, "GT.png"))
                 Image.fromarray(to_u8(lr_up[j])).save(os.path.join(vis_root, "LR_up.png"))
-                Image.fromarray(to_u8(control[j])).save(os.path.join(vis_root, "CONTROL.png"))
+
+                # CONTROL might not be RGB; try best-effort save if it is 3ch
+                try:
+                    c = control[j]
+                    if c.ndim == 3 and c.shape[0] == 3:
+                        Image.fromarray(to_u8(c)).save(os.path.join(vis_root, "CONTROL.png"))
+                except Exception:
+                    pass
 
                 with open(os.path.join(vis_root, "metrics.txt"), "w") as f:
                     f.write(f"step: {step}\n")
                     f.write(f"batch_idx: {i}\n")
                     f.write(f"sample_idx: {j}\n")
                     f.write(f"sample_steps: {num_steps}\n")
+                    f.write("\n# Color correction\n")
+                    f.write(f"enable_color_correction: {bool(getattr(self.cfg, 'enable_color_correction', True))}\n")
+                    f.write(f"color_correction_method: {getattr(self.cfg, 'color_correction_method', 'reinhard')}\n")
+                    f.write(f"color_correction_ref: {getattr(self.cfg, 'color_correction_ref', 'lr')} (LR_up)\n")
+                    f.write(f"color_ref_blur_ksize: {getattr(self.cfg, 'color_ref_blur_ksize', 31)}\n")
+
                     f.write("\n# RAW (before color correction)\n")
                     f.write(f"PSNR_raw: {psnr_raw_list[-1]:.6f}\n")
                     f.write(f"SSIM_raw: {ssim_raw_list[-1]:.6f}\n")
                     f.write(f"LPIPS_raw: {lpips_raw_list[-1]:.6f}\n")
                     f.write(f"ST-LPIPS_raw: {stlpips_raw_list[-1]:.6f}\n")
-                    f.write("\n# CC (after color correction)\n")
+
+                    f.write("\n# CC (after color correction; ref=LR_up)\n")
                     f.write(f"PSNR: {psnr_list[-1]:.6f}\n")
                     f.write(f"SSIM: {ssim_list[-1]:.6f}\n")
                     f.write(f"LPIPS: {lpips_list[-1]:.6f}\n")
                     f.write(f"ST-LPIPS: {stlpips_list[-1]:.6f}\n")
 
                 vis_saved = True
-                print(f"[val] saved SR_raw/SR_cc/GT/LR_up/CONTROL to: {vis_root}")
+                print(f"[val] saved SR_raw/SR_cc/GT/LR_up to: {vis_root}")
                 self._prune_val_vis()
 
-        # back to train mode
+        # restore training modes (keep unet state consistent with training loop)
         self.controlnet.train()
         self.ctrl_gen.train()
+        self.unet.train()
 
         results = {
-            # ✅ main metrics use corrected SR (this will drive best-PSNR checkpoint)
+            # ✅ main metrics use corrected SR (after color correction w/ LR reference)
             "PSNR": float(np.mean(psnr_list)) if psnr_list else 0.0,
             "SSIM": float(np.mean(ssim_list)) if ssim_list else 0.0,
             "LPIPS": float(np.mean(lpips_list)) if lpips_list else 0.0,
             "ST-LPIPS": float(np.mean(stlpips_list)) if stlpips_list else 0.0,
 
-            # extra: raw metrics for ablation/logging
+            # extra: raw metrics
             "PSNR_raw": float(np.mean(psnr_raw_list)) if psnr_raw_list else 0.0,
             "SSIM_raw": float(np.mean(ssim_raw_list)) if ssim_raw_list else 0.0,
             "LPIPS_raw": float(np.mean(lpips_raw_list)) if lpips_raw_list else 0.0,
@@ -970,7 +1009,8 @@ class DiffusionSRControlNetTrainer:
 
         print(
             f"[val @ step {step}] "
-            f"PSNR(raw)={results['PSNR_raw']:.3f} -> PSNR(cc)={results['PSNR']:.3f} | "
-            f"SSIM(raw)={results['SSIM_raw']:.4f} -> SSIM(cc)={results['SSIM']:.4f}"
+            f"PSNR(raw)={results['PSNR_raw']:.3f} -> PSNR(cc|ref=LR)={results['PSNR']:.3f} | "
+            f"SSIM(raw)={results['SSIM_raw']:.4f} -> SSIM(cc|ref=LR)={results['SSIM']:.4f}"
         )
         return results
+
