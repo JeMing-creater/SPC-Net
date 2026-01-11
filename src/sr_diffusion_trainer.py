@@ -96,7 +96,7 @@ class SRTrainConfig:
     color_correction_method: str = "reinhard"   # currently: reinhard
     color_correction_ref: str = "lr"            # ✅ "lr" (recommended), or "template"
     color_template_path: str = ""               # used when ref="template"
-    color_ref_blur_ksize: int = 31              # ✅ blur LR_up reference to stabilize stain (odd >=1)
+    color_lowpass_ksize: int = 51              # ✅ blur LR_up reference to stabilize stain (odd >=1)
 
 def make_control_image_from_lr_fallback(lr_up: torch.Tensor) -> torch.Tensor:
     """
@@ -352,82 +352,98 @@ class DiffusionSRControlNetTrainer:
     
     def _reinhard_color_match_u8(self, src_rgb_u8: np.ndarray, ref_rgb_u8: np.ndarray) -> np.ndarray:
         """
-        Reinhard color transfer in LAB space (8-bit, PIL backend).
+        Reinhard color transfer in LAB space (8-bit).
         src_rgb_u8/ref_rgb_u8: [H,W,3] uint8 RGB
         return: corrected RGB uint8 [H,W,3]
         """
-        # PIL expects uint8
         src_lab = Image.fromarray(src_rgb_u8, mode="RGB").convert("LAB")
         ref_lab = Image.fromarray(ref_rgb_u8, mode="RGB").convert("LAB")
 
         src = np.array(src_lab).astype(np.float32)  # [H,W,3]
         ref = np.array(ref_lab).astype(np.float32)
 
-        # per-channel mean/std
-        src_mu = src.reshape(-1, 3).mean(axis=0)
-        src_std = src.reshape(-1, 3).std(axis=0) + 1e-6
-        ref_mu = ref.reshape(-1, 3).mean(axis=0)
-        ref_std = ref.reshape(-1, 3).std(axis=0) + 1e-6
+        src_flat = src.reshape(-1, 3)
+        ref_flat = ref.reshape(-1, 3)
+
+        src_mu = src_flat.mean(axis=0)
+        src_std = src_flat.std(axis=0)
+        ref_mu = ref_flat.mean(axis=0)
+        ref_std = ref_flat.std(axis=0)
+
+        # avoid divide-by-zero / over-amplification
+        src_std = np.maximum(src_std, 1.0)
+        ref_std = np.maximum(ref_std, 1.0)
 
         out = (src - src_mu) / src_std
         out = out * ref_std + ref_mu
         out = np.clip(out, 0, 255).astype(np.uint8)
 
         out_rgb = Image.fromarray(out, mode="LAB").convert("RGB")
-        return np.array(out_rgb)
+        return np.array(out_rgb, dtype=np.uint8)
 
+    
+    def _gaussian_blur_u8(self, rgb_u8: np.ndarray, ksize: int = 51) -> np.ndarray:
+        """
+        Low-pass filtering (Gaussian blur) for uint8 RGB image.
+        ksize: odd int, larger => more global/low-frequency only.
+        """
+        k = int(ksize)
+        if k < 1:
+            return rgb_u8
+        if k % 2 == 0:
+            k += 1
 
+        # radius mapping: ksize≈6*radius (heuristic)
+        radius = max(1, k // 6)
+        return np.array(
+            Image.fromarray(rgb_u8, mode="RGB").filter(ImageFilter.GaussianBlur(radius=radius)),
+            dtype=np.uint8,
+        )
+    
     def _apply_color_correction_batch(self, sr_01: torch.Tensor, lr_up_01: torch.Tensor) -> torch.Tensor:
         """
-        Apply color correction to SR using only LR (or template).
-        sr_01:    [B,3,H,W] in [0,1]
-        lr_up_01: [B,3,H,W] in [0,1]  (bicubic upsampled LR to match SR size)
-        return: sr_cc [B,3,H,W] in [0,1]
+        Color correction using ONLY LR (lr_up) as reference, via low-frequency transfer.
+
+        Uses cfg.color_lowpass_ksize to control the blur strength.
         """
         if not bool(getattr(self.cfg, "enable_color_correction", True)):
             return sr_01
 
         method = str(getattr(self.cfg, "color_correction_method", "reinhard")).lower()
-        ref_mode = str(getattr(self.cfg, "color_correction_ref", "lr")).lower()
-
         if method != "reinhard":
             return sr_01
 
-        # optional template reference (deployment-friendly)
-        template_rgb_u8 = None
-        if ref_mode == "template":
-            p = str(getattr(self.cfg, "color_template_path", "") or "")
-            if p and os.path.isfile(p):
-                template_rgb_u8 = np.array(Image.open(p).convert("RGB"), dtype=np.uint8)
+        # ✅ THIS IS THE CALL YOU ARE MISSING:
+        ksize = int(getattr(self.cfg, "color_lowpass_ksize", 51) or 51)
+        if ksize < 1:
+            ksize = 1
+        if ksize % 2 == 0:
+            ksize += 1
 
-        # optional blur on LR_up reference to stabilize color statistics
-        k = int(getattr(self.cfg, "color_ref_blur_ksize", 31) or 0)
-        if k < 1:
-            k = 1
-        if k % 2 == 0:
-            k += 1  # ensure odd
-
-        # convert to uint8 RGB on CPU
+        # convert SR and LR_up to uint8 RGB (CPU)
         sr_u8 = (sr_01.detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
-        lr_u8 = (lr_up_01.detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+        ref_u8 = (lr_up_01.detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
 
-        sr_cc_list = []
+        out_list = []
         for i in range(sr_u8.shape[0]):
             src = sr_u8[i]
+            ref = ref_u8[i]
 
-            if template_rgb_u8 is not None:
-                ref = template_rgb_u8
-            else:
-                # ref from LR_up (only LR available)
-                ref = lr_u8[i]
-                if k > 1:
-                    ref = np.array(Image.fromarray(ref).filter(ImageFilter.GaussianBlur(radius=k // 6)), dtype=np.uint8)
+            # low-frequency components (controlled by ksize)
+            src_low = self._gaussian_blur_u8(src, ksize=ksize)
+            ref_low = self._gaussian_blur_u8(ref, ksize=ksize)
 
-            out = self._reinhard_color_match_u8(src, ref)  # uint8 RGB
+            # match only low-frequency color statistics
+            src_low_cc = self._reinhard_color_match_u8(src_low, ref_low)  # uint8 RGB
+
+            # inject only low-frequency delta back to SR (preserve local contrast)
+            delta = src_low_cc.astype(np.int16) - src_low.astype(np.int16)
+            out = np.clip(src.astype(np.int16) + delta, 0, 255).astype(np.uint8)
+
             out_t = torch.from_numpy(out).permute(2, 0, 1).float() / 255.0
-            sr_cc_list.append(out_t)
+            out_list.append(out_t)
 
-        sr_cc = torch.stack(sr_cc_list, dim=0).to(device=sr_01.device, dtype=sr_01.dtype)
+        sr_cc = torch.stack(out_list, dim=0).to(device=sr_01.device, dtype=sr_01.dtype)
         return sr_cc.clamp(0, 1)
     
     # ----------------------------

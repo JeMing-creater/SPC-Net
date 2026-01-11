@@ -1,5 +1,5 @@
 trainer:
-  batch_size: 8
+  batch_size: 6
 
 checkpoint: TryFirst
 
