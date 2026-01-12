@@ -402,9 +402,8 @@ class DiffusionSRControlNetTrainer:
     
     def _apply_color_correction_batch(self, sr_01: torch.Tensor, lr_up_01: torch.Tensor) -> torch.Tensor:
         """
-        Color correction using ONLY LR (lr_up) as reference, via low-frequency transfer.
-
-        Uses cfg.color_lowpass_ksize to control the blur strength.
+        Color correction using ONLY LR_up as reference, via low-frequency transfer,
+        with tissue-mask gating to avoid tinting white background.
         """
         if not bool(getattr(self.cfg, "enable_color_correction", True)):
             return sr_01
@@ -413,39 +412,79 @@ class DiffusionSRControlNetTrainer:
         if method != "reinhard":
             return sr_01
 
-        # ✅ THIS IS THE CALL YOU ARE MISSING:
+        # low-pass strength
         ksize = int(getattr(self.cfg, "color_lowpass_ksize", 51) or 51)
         if ksize < 1:
             ksize = 1
         if ksize % 2 == 0:
             ksize += 1
 
+        # tissue mask thresholds (can expose later if needed)
+        s_thr = float(getattr(self.cfg, "tissue_s_thr", 0.08))   # saturation threshold
+        v_thr = float(getattr(self.cfg, "tissue_v_thr", 0.92))   # value threshold
+        mask_blur = int(getattr(self.cfg, "tissue_mask_blur", 9) or 9)  # feather edge
+
         # convert SR and LR_up to uint8 RGB (CPU)
         sr_u8 = (sr_01.detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
         ref_u8 = (lr_up_01.detach().clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+
+        def rgb_to_hsv01(rgb_u8: np.ndarray) -> np.ndarray:
+            # rgb_u8: [H,W,3] uint8
+            x = rgb_u8.astype(np.float32) / 255.0
+            r, g, b = x[..., 0], x[..., 1], x[..., 2]
+            mx = np.maximum(np.maximum(r, g), b)
+            mn = np.minimum(np.minimum(r, g), b)
+            diff = mx - mn
+
+            # Hue not needed; only S and V
+            v = mx
+            s = np.where(mx > 1e-6, diff / (mx + 1e-6), 0.0)
+            hsv = np.stack([np.zeros_like(v), s, v], axis=-1)  # [H,W,3]
+            return hsv
 
         out_list = []
         for i in range(sr_u8.shape[0]):
             src = sr_u8[i]
             ref = ref_u8[i]
 
-            # low-frequency components (controlled by ksize)
+            # ---- build tissue mask from reference (LR_up) ----
+            hsv = rgb_to_hsv01(ref)
+            s = hsv[..., 1]
+            v = hsv[..., 2]
+            tissue = ((s > s_thr) | (v < v_thr)).astype(np.float32)  # [H,W] 0/1
+
+            # feather mask edges (soft blending)
+            if mask_blur and mask_blur > 1:
+                mb = mask_blur if (mask_blur % 2 == 1) else (mask_blur + 1)
+                tissue_u8 = (tissue * 255).astype(np.uint8)
+                tissue_soft = np.array(
+                    Image.fromarray(tissue_u8).filter(ImageFilter.GaussianBlur(radius=max(1, mb // 6))),
+                    dtype=np.uint8,
+                ).astype(np.float32) / 255.0
+                tissue = tissue_soft
+
+            tissue3 = tissue[..., None]  # [H,W,1]
+
+            # ---- low-frequency components ----
             src_low = self._gaussian_blur_u8(src, ksize=ksize)
             ref_low = self._gaussian_blur_u8(ref, ksize=ksize)
 
-            # match only low-frequency color statistics
+            # Reinhard match only low-frequency
             src_low_cc = self._reinhard_color_match_u8(src_low, ref_low)  # uint8 RGB
 
-            # inject only low-frequency delta back to SR (preserve local contrast)
-            delta = src_low_cc.astype(np.int16) - src_low.astype(np.int16)
-            out = np.clip(src.astype(np.int16) + delta, 0, 255).astype(np.uint8)
+            # delta on low-frequency
+            delta = (src_low_cc.astype(np.float32) - src_low.astype(np.float32))  # [H,W,3]
+
+            # ✅ apply delta only on tissue region, keep background intact
+            out = src.astype(np.float32) + delta * tissue3
+            out = np.clip(out, 0, 255).astype(np.uint8)
 
             out_t = torch.from_numpy(out).permute(2, 0, 1).float() / 255.0
             out_list.append(out_t)
 
         sr_cc = torch.stack(out_list, dim=0).to(device=sr_01.device, dtype=sr_01.dtype)
         return sr_cc.clamp(0, 1)
-    
+
     # ----------------------------
     # checkpoint utils
     # ----------------------------
