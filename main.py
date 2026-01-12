@@ -138,6 +138,9 @@ if __name__ == "__main__":
         vfm_unfreeze_last_blocks=int(getattr(config.sr.vfm, "vfm_unfreeze_last_blocks", 2)),
         vfm_warmup_steps=int(getattr(config.sr.vfm, "vfm_warmup_steps", 0)),
         vfm_lr=float(getattr(config.sr.vfm, "vfm_lr", 1e-6)),
+        enable_color_correction=bool(getattr(config.sr, "enable_color_correction", False)),
+        color_correction_ref=str(getattr(config.sr, "color_correction_ref", "lr")),          
+        color_lowpass_ksize=int(getattr(config.sr, "color_lowpass_ksize", 51)),
     )
     
     trainer = DiffusionSRControlNetTrainer(tcfg, token=getattr(config.sr, "token", None))

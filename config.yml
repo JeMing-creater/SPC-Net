@@ -1,6 +1,27 @@
 trainer:
   batch_size: 16
 
+valer:
+  ckpt_tag: best          # best / latest
+  max_batches: 10         # validate 抽样 batch 数
+
+  do_val: true
+  do_test: true
+
+  do_dir_infer: true
+  eval_output_dir: ./outputs/sr_controlnet/eval
+  infer_lr_root: /mnt/liangjm/SpRR_data/lr_png/TCGA-05-4244-01Z-00-DX1
+  infer_hr_root: /mnt/liangjm/SpRR_data/hr_png/TCGA-05-4244-017-00-DX1   # 可选：用于复制HR对照
+  infer_disc_map_root: /mnt/liangjm/SpRR_data/disc_maps/TCGA-05-4244-017-00-DX1  # 可选：用于保存SAM图
+  infer_out: ./outputs/sr_controlnet/eval_infer/TCGA-05-4244-017-00-DX1
+  infer_steps: 20
+  infer_limit: 50      # 0 表示不限
+  save_control: true
+  save_dino_energy: true
+  save_disc_map: true
+
+do_dir_infer: false
+
 checkpoint: TryFirst
 
 data_loader:
@@ -67,6 +88,12 @@ sr:
   val_every: 100        # 每多少 step 做一次验证
   val_batches: 10       # 验证取多少个 batch
   sample_steps: 20      # 采样(反推)步数：20先跑通，后续可调到30/50
+
+  # color correction 配置
+  enable_color_correction: True
+  color_correction_method: reinhard   # currently: reinhard
+  color_correction_ref: lr            # ✅ "lr" (recommended), or "template"
+  color_lowpass_ksize: 51              # ✅ blur LR_up reference to stabilize stain (odd >=1)
 
 TCGA_LUAD:
   root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-LUAD/
