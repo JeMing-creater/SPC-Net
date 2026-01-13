@@ -494,54 +494,54 @@ class DiffusionSRControlNetTrainer:
 
         # default no-op
         return sr_01
-        # ----------------------------
-        # checkpoint utils
-        # ----------------------------
-        def _ckpt_root_dir(self) -> str:
-            return os.path.join(self.cfg.output_dir, getattr(self.cfg, "ckpt_root", "checkpoints"))
+    # ----------------------------
+    # checkpoint utils
+    # ----------------------------
+    def _ckpt_root_dir(self) -> str:
+        return os.path.join(self.cfg.output_dir, getattr(self.cfg, "ckpt_root", "checkpoints"))
 
-        def _ckpt_dir(self, step: int) -> str:
-            return os.path.join(self._ckpt_root_dir(), f"step_{step:08d}")
+    def _ckpt_dir(self, step: int) -> str:
+        return os.path.join(self._ckpt_root_dir(), f"step_{step:08d}")
 
-        def _find_latest_checkpoint(self) -> Optional[str]:
-            ckpt_root = self._ckpt_root_dir()
-            if not os.path.isdir(ckpt_root):
-                return None
+    def _find_latest_checkpoint(self) -> Optional[str]:
+        ckpt_root = self._ckpt_root_dir()
+        if not os.path.isdir(ckpt_root):
+            return None
 
-            # ✅ New: prefer "latest" dir (single latest checkpoint)
-            latest_dir = os.path.join(ckpt_root, "latest")
-            if os.path.isdir(os.path.join(latest_dir, "controlnet")):
-                # if full ckpt required, check trainer_state.pt
-                if getattr(self.cfg, "save_full_ckpt", False):
-                    if os.path.isfile(os.path.join(latest_dir, "trainer_state.pt")):
-                        return latest_dir
-                else:
+        # ✅ New: prefer "latest" dir (single latest checkpoint)
+        latest_dir = os.path.join(ckpt_root, "latest")
+        if os.path.isdir(os.path.join(latest_dir, "controlnet")):
+            # if full ckpt required, check trainer_state.pt
+            if getattr(self.cfg, "save_full_ckpt", False):
+                if os.path.isfile(os.path.join(latest_dir, "trainer_state.pt")):
                     return latest_dir
+            else:
+                return latest_dir
 
-            # Fallback: legacy step_XXXXXXXX dirs (keep for backward compatibility)
-            step_re = re.compile(r"^step_(\d+)$")
-            best_step = -1
-            best_dir = None
+        # Fallback: legacy step_XXXXXXXX dirs (keep for backward compatibility)
+        step_re = re.compile(r"^step_(\d+)$")
+        best_step = -1
+        best_dir = None
 
-            for name in os.listdir(ckpt_root):
-                m = step_re.match(name)
-                if not m:
+        for name in os.listdir(ckpt_root):
+            m = step_re.match(name)
+            if not m:
+                continue
+            step = int(m.group(1))
+            d = os.path.join(ckpt_root, name)
+
+            if not os.path.isdir(os.path.join(d, "controlnet")):
+                continue
+
+            if getattr(self.cfg, "save_full_ckpt", False):
+                if not os.path.isfile(os.path.join(d, "trainer_state.pt")):
                     continue
-                step = int(m.group(1))
-                d = os.path.join(ckpt_root, name)
 
-                if not os.path.isdir(os.path.join(d, "controlnet")):
-                    continue
+            if step > best_step:
+                best_step = step
+                best_dir = d
 
-                if getattr(self.cfg, "save_full_ckpt", False):
-                    if not os.path.isfile(os.path.join(d, "trainer_state.pt")):
-                        continue
-
-                if step > best_step:
-                    best_step = step
-                    best_dir = d
-
-            return best_dir
+        return best_dir
 
 
     def _prune_val_vis(self):
