@@ -42,7 +42,7 @@ class SRTrainConfig:
     # -------------------------
     pretrained_sd15: str = "runwayml/stable-diffusion-v1-5"
     token: Optional[str] = None          # HuggingFace token（可选）
-    local_dir: str = ""                  # DINOv2 本地权重目录（必填：你现在是离线加载）
+    local_dir: str = "./src/models/dinov2_vitb14"                  # DINOv2 本地权重目录（必填：你现在是离线加载）
 
     # -------------------------
     # training
