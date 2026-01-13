@@ -370,7 +370,10 @@ def infer_folder_lr_to_sr_generic(
             meta["hr_path"] = _infer_pair_hr_path(lr_path, lr_dir, hr_dir)
 
         # infer SR (same function as validation)
-        sr = infer_fn(lr, hr, meta, device).clamp(0,1)
+        if name == "S3_Diff":
+            sr = infer_fn(lr, hr, meta, device).clamp(0,1)
+        else:
+            sr = infer_fn(lr, hr).clamp(0,1)
 
         # save LR_up (always size=lr_up_size for visualization)
         lr_up = F.interpolate(lr, size=(lr_up_size, lr_up_size), mode="bicubic", align_corners=False)
@@ -514,7 +517,7 @@ if __name__ == "__main__":
         lr_dir=LR_FOLDER_TO_INFER,
         hr_dir=HR_FOLDER_TO_INFER,
         out_root="./output",
-        name="ours",
+        name=METHOD_NAME,
         infer_fn=infer_fn_ours,
         device=DEVICE,
         lr_up_size=512,
